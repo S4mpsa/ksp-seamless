@@ -35,6 +35,8 @@ namespace Seamless
         private readonly TextMeshProUGUI title, details, markerLabel;
         private readonly RawImage frozen;
         private Texture2D frozenTex;
+        // with HDR output the frozen frame is drawn as part of the 3D picture (see SceneLayer)
+        private readonly SceneLayer layer;
         private readonly float barFraction;
         private int sizedForHeight = -1;
 
@@ -47,8 +49,10 @@ namespace Seamless
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             canvas.sortingOrder = 32000;
 
+            if (persistent && SceneLayer.HdrOutput) layer = new SceneLayer(true);
             var fgo = new GameObject("FrozenFrame", typeof(RectTransform));
-            fgo.transform.SetParent(root.transform, false);
+            fgo.transform.SetParent(layer != null ? layer.Parent : root.transform, false);
+            if (layer != null) layer.Adopt(fgo);
             frozen = fgo.AddComponent<RawImage>();
             frozen.raycastTarget = false;
             frozen.color = new Color(1, 1, 1, 0);
@@ -88,6 +92,7 @@ namespace Seamless
         public void Destroy()
         {
             if (root != null) Object.Destroy(root);
+            if (layer != null) layer.Destroy();
             if (ringTex != null) Object.Destroy(ringTex);
             if (frozenTex != null) Object.Destroy(frozenTex);
         }
@@ -101,6 +106,23 @@ namespace Seamless
             frozen.texture = tex;
             frozen.gameObject.SetActive(tex != null);
         }
+
+        /// <summary>Call before the frame to freeze renders. With HDR output its 3D picture is then
+        /// kept for <see cref="TakeSceneCapture"/>; otherwise nothing happens.</summary>
+        public void BeginSceneCapture()
+        {
+            if (layer != null) layer.BeginCapture();
+        }
+
+        /// <summary>The 3D picture of the frame that just rendered, without the bars and the card,
+        /// or null to freeze a screenshot instead.</summary>
+        public Texture2D TakeSceneCapture()
+        {
+            return layer != null ? layer.TakeCapture() : null;
+        }
+
+        /// <summary>The frozen frame is drawn under the game's UI cameras instead of over everything.</summary>
+        public bool FrozenUnderUi => layer != null;
 
         public void SetTexts(string titleText, string detailText)
         {
@@ -123,6 +145,7 @@ namespace Seamless
                 frozen.uvRect = new Rect(f.FrozenPivot.x * (1f - w), f.FrozenPivot.y * (1f - w), w, w);
                 frozen.color = new Color(1, 1, 1, Mathf.Clamp01(f.FrozenAlpha));
             }
+            if (layer != null) layer.Show(frozenTex != null && f.FrozenAlpha > 0f, f.FrozenAlpha >= 1f);
 
             if (f.LowerThird)
             {

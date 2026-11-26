@@ -1,13 +1,15 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using HarmonyLib;
+using UnityEngine.SceneManagement;
 
 namespace Seamless
 {
     /// <summary>The only class touching Harmony, so the mod still loads (arrivals only) without it.</summary>
     internal static class HarmonyHook
     {
-        /// <summary>HighLogic.bufferedLoad is hooked, so a preloaded scene can be finished.</summary>
+        /// <summary>The game's scene loads are hooked, so a preloaded scene can be finished.</summary>
         internal static bool PreloadReady;
 
         internal static int TextureLoaderDeferrals;
@@ -22,6 +24,9 @@ namespace Seamless
             {
                 var buffered = AccessTools.Method(typeof(HighLogic), nameof(HighLogic.bufferedLoad), new[] { typeof(int), typeof(bool) });
                 harmony.Patch(buffered, prefix: new HarmonyMethod(typeof(HarmonyHook), nameof(BufferedLoadPrefix)));
+                // Where HighLogic.LoadScene loads the scene itself (KSP's unbuffered switches, every
+                // switch on Retooled) bufferedLoad never runs: that call is ours as well.
+                harmony.Patch(target, transpiler: new HarmonyMethod(typeof(HarmonyHook), nameof(LoadSceneTranspiler)));
                 PreloadReady = true;
             }
             catch (Exception e) { Log.Warn("scene preload unavailable: " + e.Message); }
@@ -104,6 +109,13 @@ namespace Seamless
             if (mine == null) return true;
             __result = mine;
             return false;
+        }
+
+        private static IEnumerable<CodeInstruction> LoadSceneTranspiler(IEnumerable<CodeInstruction> instructions)
+        {
+            return instructions.MethodReplacer(
+                AccessTools.Method(typeof(SceneManager), nameof(SceneManager.LoadScene), new[] { typeof(int) }),
+                AccessTools.Method(typeof(ScenePreload), nameof(ScenePreload.LoadScene)));
         }
 
         private static bool EventFirePrefix(EventVoid __instance)

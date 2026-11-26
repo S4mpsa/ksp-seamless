@@ -216,10 +216,12 @@ namespace Seamless
         }
 
         /// <summary>Any scene change: KSP's loading screen is drawn normally again (under our card
-        /// when the change is ours).</summary>
+        /// when the change is ours). Where the frozen frame is drawn under the UI cameras it would
+        /// cover the frame instead, so there it stays off through our own load.</summary>
         private void OnSceneLoadRequested(GameScenes scene)
         {
             RestoreMask();
+            if (loadIssued && phase == Phase.Loading && overlay != null && overlay.FrozenUnderUi) SuppressMask();
             if (stockEndPending) { stockEndPending = false; Log.Info("next scene requested before KSP's loading screen ended"); }
         }
 
@@ -1320,7 +1322,12 @@ namespace Seamless
                     HoldVessels();
                     if (!departAlive()) { Freeze(false); break; }
                     ApplyCurrent(true);
-                    if (t >= turnSeconds + travelSeconds) { phase = Phase.Capture; StartCoroutine(CaptureAtEndOfFrame()); }
+                    if (t >= turnSeconds + travelSeconds)
+                    {
+                        phase = Phase.Capture;
+                        overlay.BeginSceneCapture();
+                        StartCoroutine(CaptureAtEndOfFrame());
+                    }
                     break;
 
                 case Phase.Capture:
@@ -1595,7 +1602,7 @@ namespace Seamless
             {
                 if (capture)
                 {
-                    Texture2D tex = ScreenCapture.CaptureScreenshotAsTexture();
+                    Texture2D tex = overlay.TakeSceneCapture() ?? ScreenCapture.CaptureScreenshotAsTexture();
                     var px = tex.GetPixels32();
                     for (int i = 0; i < px.Length; i++) px[i].a = 255;   // the back buffer's alpha is not reliable
                     tex.SetPixels32(px);
@@ -1805,6 +1812,11 @@ namespace Seamless
             // Near the ground (launch, landed / flying craft) the terrain is still being built until
             // the craft is unpacked: the card stays up until then. In space it starts at once.
             waitUnpack = S.liveLoading && (kind == Kind.Launch || Shots.SurfaceLike(v)) && v.packed;
+            if (waitUnpack && HeldByPhysicsHold(v))
+            {
+                waitUnpack = false;
+                Log.Info("the craft is held by PhysicsHold - not waiting for it to unpack");
+            }
 
             titleText = v.vesselName;
             detailText = SwitchDetails(v);
@@ -1821,6 +1833,20 @@ namespace Seamless
             unpackLogged = !v.packed;
             phase = Phase.Arrive;
             ArriveApply(true);
+        }
+
+        /// <summary>The PhysicsHold mod is installed and its hold is on for this craft: it stays
+        /// packed for as long as the hold is on, so there is no unpacking to wait for.</summary>
+        private static bool HeldByPhysicsHold(Vessel v)
+        {
+            try
+            {
+                Component hold = v.GetComponent("VesselPhysicsHold");
+                if (hold == null) return false;
+                FieldInfo held = hold.GetType().GetField("physicsHold");
+                return held != null && (bool)held.GetValue(hold);
+            }
+            catch { return false; }
         }
 
         private void ArriveStep()

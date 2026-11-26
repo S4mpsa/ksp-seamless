@@ -14,7 +14,9 @@ namespace Seamless
     /// transition starts, held before activation (Unity stops it at 90 %), and when the departure
     /// ends a Harmony prefix on <c>bufferedLoad</c> runs <see cref="Finish"/> in its place: the old
     /// scene's objects are destroyed (as the loadingBuffer scene would), then the new scene is
-    /// activated, then the old scene's assets are unloaded.
+    /// activated, then the old scene's assets are unloaded. A game that loads the scene straight
+    /// from <c>HighLogic.LoadScene</c> (Retooled) never calls <c>bufferedLoad</c>, so that
+    /// <c>SceneManager.LoadScene</c> call is replaced with <see cref="LoadScene"/>, which does the same.
     ///
     /// Costs: while held, Unity's whole async-load queue waits behind it (asset bundle / async
     /// resource loads requested during the departure finish only after the switch), and the old
@@ -97,8 +99,8 @@ namespace Seamless
             }
         }
 
-        /// <summary>Harmony prefix body for HighLogic.bufferedLoad: the replacement coroutine, or null
-        /// to run KSP's own.</summary>
+        /// <summary>For the game's scene load (the HighLogic.bufferedLoad prefix, <see cref="LoadScene"/>):
+        /// the replacement coroutine, or null to run KSP's own.</summary>
         internal static IEnumerator TakeOver(int sceneToBeLoaded)
         {
             if (op == null) return null;
@@ -109,6 +111,18 @@ namespace Seamless
                 return Chain(Finish(), sceneToBeLoaded);
             }
             return Finish();
+        }
+
+        /// <summary>Stands in for the SceneManager.LoadScene call in HighLogic.LoadScene, where the
+        /// game loads a scene without bufferedLoad: a held preload is finished, as the bufferedLoad
+        /// prefix would (the game's own load would queue behind it and never start).</summary>
+        internal static void LoadScene(int sceneToBeLoaded)
+        {
+            IEnumerator mine;
+            try { mine = TakeOver(sceneToBeLoaded); }
+            catch (Exception e) { Log.Warn("preloaded scene not used: " + e); mine = null; }
+            if (mine != null) HighLogic.fetch.StartCoroutine(mine);
+            else SceneManager.LoadScene(sceneToBeLoaded);
         }
 
         private static IEnumerator Chain(IEnumerator first, int then)
