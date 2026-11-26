@@ -224,7 +224,7 @@ namespace Seamless
         {
             // the oldest of the last 6 lines is outside the window
             float oldest = foreignLogs[foreignLogNext];
-            return MaskHidden() && smooth >= 30 && Time.realtimeSinceStartup - oldest >= S.settleQuietSeconds;
+            return MaskHidden() && smooth >= 10 && Time.realtimeSinceStartup - oldest >= S.settleQuietSeconds;
         }   // the zoom goes around the planet (anchor hidden behind it)
         private double skyWeight;
 
@@ -1873,9 +1873,12 @@ namespace Seamless
                 flightLen = L; flightPeak = V; flightRamp = Ta; flightProfileT = Tp;
                 // never quicker than before, never longer than departMaxSeconds (a capped trip runs
                 // the same profile a little faster)
-                // a direct flight also covers the zoom in that otherwise follows it
-                double cap = S.departMaxSeconds + (directFlight ? S.zoomInSeconds : 0f);
-                double T = Math.Min(Math.Max(total0, Tp), Math.Max(total0, cap));
+                // A flight is never shorter than departSeconds (or the opening turn, which runs on
+                // its own clock alongside it) and never longer than departMaxSeconds; a direct
+                // flight also covers part of the zoom in that otherwise follows a load.
+                double floor = Math.Max(S.departSeconds, S.departTurnSeconds);
+                double cap = S.departMaxSeconds + (directFlight ? 0.5 * S.zoomInSeconds : 0.0);
+                double T = Math.Min(Math.Max(floor, Tp), Math.Max(floor, cap));
                 flightT = T;
                 travelSeconds = Math.Max(0.1, T - turnSeconds);
                 if (turnSeconds > T - 0.1) { turnSeconds = 0.5 * T; travelSeconds = T - turnSeconds; }
@@ -2155,8 +2158,14 @@ namespace Seamless
                 Log.Info("the craft is held by PhysicsHold - not waiting for it to unpack");
             }
 
-            titleText = v.vesselName;
-            detailText = SwitchDetails(v);
+            // The departure's card already named this craft: keep its text. A different text here
+            // (a launch's "Launch Pad" against "Standing by to launch") showed both at once while
+            // the frozen frame - a copy of the departure's card - dissolved over the new one.
+            if (titleText != v.vesselName || string.IsNullOrEmpty(detailText))
+            {
+                titleText = v.vesselName;
+                detailText = SwitchDetails(v);
+            }
             overlay.SetTexts(titleText, detailText);
             Log.Info("arriving on " + v.vesselName + "; " + overlay.Describe());
 
@@ -2326,7 +2335,7 @@ namespace Seamless
                 double live = t - liveAt;
                 if (live > 0.5 && (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)))
                     StartReturn(Math.Min(S.zoomInSeconds, 2.0));
-                else if (live >= S.establishSeconds && (smooth >= 10 || live > 45.0 || !S.liveLoading))
+                else if (live >= S.establishSeconds && (smooth >= 3 || live > 45.0 || !S.liveLoading))
                 {
                     Milestone("zoom in");
                     StartReturn(S.zoomInSeconds);
@@ -2666,8 +2675,9 @@ namespace Seamless
                 kscWarmDoneAt = t;
                 Milestone(t > S.settleMaxSeconds ? "Space Center view still busy, going on" : "Space Center view built");
             }
-            if (kscWarmDoneAt >= 0 && kscSettledAt < 0 && t >= kscWarmDoneAt + 0.3
-                && (Settled() || t > kscWarmDoneAt + S.settleMaxSeconds || !S.liveLoading))
+            // the planet shot itself needs no settling of its own (the terrain is off up there):
+            // the card goes as soon as the Space Center view is built
+            if (kscWarmDoneAt >= 0 && kscSettledAt < 0)
             {
                 kscSettledAt = t;
                 Milestone((t > kscWarmDoneAt + S.settleMaxSeconds ? "scene still busy, going on" : "scene settled")
@@ -2675,7 +2685,7 @@ namespace Seamless
             }
             if (retStart < 0 && t > 0.5 && (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)))
             { if (kscWarmDoneAt < 0) kscWarmDoneAt = t; if (kscSettledAt < 0) kscSettledAt = t; retStart = t; retDur = Math.Min(S.zoomInSeconds, 2.0); PlanKsc(); }
-            else if (retStart < 0 && kscSettledAt >= 0 && t >= kscSettledAt + hold && (smooth >= 10 || t > kscSettledAt + hold + 45.0 || !S.liveLoading))
+            else if (retStart < 0 && kscSettledAt >= 0 && t >= kscSettledAt + hold && (smooth >= 3 || t > kscSettledAt + hold + 45.0 || !S.liveLoading))
             {
                 // the shot holds while the game still stalls finishing its load
                 Milestone("zoom down");
@@ -2981,12 +2991,13 @@ namespace Seamless
 
         private void RevealFrame()
         {
-            if (t < 1.5) KeepHudOff();
-            float frozenA = 1f - Overlay.Ease((float)((t - 0.3) / 1.2));
+            if (t < 0.9) KeepHudOff();
+            // quick: the scene is ready, the reveal only dissolves the card
+            float frozenA = 1f - Overlay.Ease((float)((t - 0.1) / 0.7));
             float textOut = frozenA;   // the frozen frame holds a copy of the card: fade them together
             var f = new OverlayFrame
             {
-                Bars = 1f - Overlay.Ease((float)((t - 0.6) / 1.2)),
+                Bars = 1f - Overlay.Ease((float)((t - 0.3) / 0.8)),
                 FrozenAlpha = frozenA,
                 FrozenZoom = frozenZoom,
                 LowerThird = lowerThird || !frozenPlanetOnScreen,
@@ -3002,7 +3013,7 @@ namespace Seamless
                 f.PlanetRadius = frozenPlanetRadius * frozenZoom;
             }
             overlay.Apply(f);
-            if (t >= 1.9) Cleanup();
+            if (t >= 1.1) Cleanup();
         }
 
         private void Unpause()

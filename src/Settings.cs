@@ -50,13 +50,13 @@ namespace Seamless
         public bool editorExitTransition = true;   // VAB / SPH -> Space Center
         public bool trackingFromSpaceCenter = true;// Space Center -> Tracking Station
         public bool launchTransition = true;       // VAB / SPH -> launch site
-        public float launchHoldSeconds = 1.2f;     // bars + card over the editor before the load
+        public float launchHoldSeconds = 0.5f;     // bars + card over the editor before the load
         public bool spaceCenterFromTrackingStation = true; // Tracking Station -> Space Center
         public bool saveLoadTransition = true;     // main menu -> a save's Space Center
-        public float saveHoldSeconds = 2.5f;       // the Kerbin shot holds this long before the zoom down
-        public float settleQuietSeconds = 1f;      // Space Center arrivals: the scene counts as settled after this long with no log output
+        public float saveHoldSeconds = 0.5f;       // the Kerbin shot holds this long before the zoom down
+        public float settleQuietSeconds = 0.5f;      // Space Center arrivals: the scene counts as settled after this long with no log output
         public float settleMaxSeconds = 30f;       // ... or after this long regardless
-        public float warmUpSeconds = 2f;           // ... first the camera waits at the Space Center view under the card (terrain, clouds built); 0 = off
+        public float warmUpSeconds = 0.5f;           // ... first the camera waits at the Space Center view under the card (terrain, clouds built); 0 = off
         public bool liveLoading = true;            // show the new scene while KSP still finishes loading it
         public bool preloadScene = true;           // read the new scene in the background during the departure
         public bool inSceneSwitch = true;          // switching to a craft in space: load it and switch in place, no scene reload
@@ -65,14 +65,14 @@ namespace Seamless
         public float cardSkipSeconds = 1.5f;       // ... no card when the load is expected to be over this soon (0 = always a card)
         public float dynamicMaxSeconds = 30f;      // ... flights are lengthened to at most this long
         public bool keepShotAngle = true;          // a switch's zoom ends looking at the craft from the opening shot's side
-        public float departTurnSeconds = 1.5f; // the opening turn towards the destination, in seconds (any trip length)
-        public float departSeconds = 3f;      // shortest flight to the destination
-        public float departMaxSeconds = 12f;  // longest flight (interplanetary)
-        public float flightMaxRate = 2f;      // flights: fastest view change, e-folds of distance (plus radians of turn) per second
-        public float flightMaxAccel = 1.5f;   // ... and its largest change per second (gentle starts and ends)
+        public float departTurnSeconds = 1f; // the opening turn towards the destination, in seconds (any trip length)
+        public float departSeconds = 1.5f;      // shortest flight to the destination
+        public float departMaxSeconds = 6f;  // longest flight (interplanetary)
+        public float flightMaxRate = 5f;      // flights: fastest view change, e-folds of distance (plus radians of turn) per second
+        public float flightMaxAccel = 6f;   // ... and its largest change per second (gentle starts and ends)
         public float loadingMinSeconds = 0f;  // the loading card shows at least this long
         public float establishSeconds = 0f;   // vessel switch: hold on the opening shot
-        public float zoomInSeconds = 5f;      // vessel switch: zoom into the normal camera view
+        public float zoomInSeconds = 2.5f;      // vessel switch: zoom into the normal camera view
 
         // keys
         public KeyCode skipKey = KeyCode.Space;
