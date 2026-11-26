@@ -36,6 +36,46 @@ namespace Seamless
     {
         private static readonly FieldInfo OffsetHdgField = typeof(FlightCamera).GetField("offsetHdg", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
         private static readonly FieldInfo OffsetPitchField = typeof(FlightCamera).GetField("offsetPitch", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly BindingFlags AnyInst = BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public;
+        private static readonly FieldInfo FoRField = typeof(FlightCamera).GetField("frameOfReference", AnyInst);
+        private static readonly FieldInfo TgtFoRField = typeof(FlightCamera).GetField("tgtFoR", AnyInst);
+        private static readonly FieldInfo LastFoRField = typeof(FlightCamera).GetField("lastFoR", AnyInst);
+        private static readonly FieldInfo FoRLerpField = typeof(FlightCamera).GetField("FoRlerp", AnyInst);
+
+        /// <summary>Puts FlightCamera's frame of reference where its own update would settle for
+        /// <paramref name="v"/> - AUTO: the surface frame for a landed craft, the orbital frame in
+        /// orbit - with the blend between frames finished. On a switch KSP restarts that blend
+        /// from the old craft's frame, but its camera update is off while a transition drives the
+        /// camera: the blend ran after the hand-back, the camera swinging from a landed craft's
+        /// surface frame to the orbital one just as the arrival ended (2026-11-26).</summary>
+        public static string SnapFrame(FlightCamera fc, Vessel v)
+        {
+            if (fc == null || v == null) return null;
+            try
+            {
+                FoRModes m = fc.FoRMode;
+                switch (fc.mode)
+                {
+                    case FlightCamera.Modes.AUTO:
+                        FlightCamera.Modes am = FlightCamera.GetAutoModeForVessel(v);
+                        fc.autoMode = am;
+                        if (am == FlightCamera.Modes.ORBITAL) m = FoRModes.OBT_ABS;
+                        else if (am == FlightCamera.Modes.FREE) m = FoRModes.SRF_NORTH;
+                        break;
+                    case FlightCamera.Modes.FREE: m = FoRModes.SRF_NORTH; break;
+                    case FlightCamera.Modes.ORBITAL: m = FoRModes.OBT_ABS; break;
+                }
+                FoRModes was = fc.FoRMode;
+                fc.FoRMode = m;
+                Quaternion q = FlightGlobals.GetFoR(m);
+                if (FoRField != null) FoRField.SetValue(fc, q);
+                if (TgtFoRField != null) TgtFoRField.SetValue(fc, q);
+                if (LastFoRField != null) LastFoRField.SetValue(fc, q);
+                if (FoRLerpField != null) FoRLerpField.SetValue(fc, 1f);
+                return was != m ? was + " -> " + m : null;
+            }
+            catch (Exception e) { Log.Warn("camera frame: " + e.Message); return null; }
+        }
 
         public readonly FlightCamera Fc;
         public readonly float OrigFov;
@@ -210,6 +250,7 @@ namespace Seamless
                 if (Fc != null)
                 {
                     if (Fc.AbortExternalControl == (Callback)OnAbort) Fc.AbortExternalControl = prevAbort;
+                    SnapFrame(Fc, FlightGlobals.ActiveVessel);
                     Transform piv = Fc.GetPivot();
                     if (piv != null) piv.rotation = PivotRotation();
                     Fc.transform.localPosition = Vector3.back * Fc.Distance;

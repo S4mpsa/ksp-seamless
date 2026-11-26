@@ -109,6 +109,18 @@ namespace Seamless
         internal static IEnumerator TakeOver(int sceneToBeLoaded)
         {
             if (op == null) return null;
+            if (finishing)
+            {
+                // The preload has already been handed to the game (activation allowed): this is a
+                // new load, e.g. KRASH reverting an unfinished simulation, which calls Game.Start()
+                // from its Start() while the preloaded scene is still activating. 1.1.0.0 handed it
+                // the same operation again, so the scene was never reloaded: mods that tear down on
+                // onGameSceneLoadRequested (Scatterer, Kopernicus ShadowMan, the scenario modules)
+                // never got their new scene. It is the game's own load.
+                Log.Info("scene " + (GameScenes)sceneToBeLoaded + " requested while the preloaded " + Target
+                    + " was activating - loading it normally");
+                return null;
+            }
             if (sceneToBeLoaded != index)
             {
                 // KSP's own load would queue behind the held one and never start: finish ours first
@@ -150,7 +162,9 @@ namespace Seamless
                 roots,
                 HarmonyHook.TextureLoaderDeferrals > 0 ? ", KSPTextureLoader kept async " + HarmonyHook.TextureLoaderDeferrals + " times" : ""));
             yield return null;
-            GC.Collect();
+            // No GC.Collect / UnloadUnusedAssets of our own: a Single-mode load unloads the unused
+            // assets (with a GC) as part of its activation. The extra pass after it cost ~1 s per
+            // load in the main install (tools/scene-load-profile, 2026-11-26).
             o.allowSceneActivation = true;
             while (!o.isDone)
             {
@@ -169,8 +183,6 @@ namespace Seamless
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                 "preloaded scene active {0:F1} s after the switch, {1:F1} s after the preload started",
                 Time.realtimeSinceStartup - t0, Time.realtimeSinceStartup - startedAt));
-            Resources.UnloadUnusedAssets();   // the old scene's assets: after the switch (the price of the preload)
-            GC.Collect();
             Application.backgroundLoadingPriority = ThreadPriority.Normal;
         }
 

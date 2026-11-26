@@ -53,6 +53,9 @@ namespace Seamless
         private GameScenes targetScene;
         private double t;
         private bool loadIssued, sceneArrived, uiHidden;
+        // the target scene has been loaded by Unity since our load; awaitReload: it was requested
+        // again after that (another mod reloading it), so its first load no longer counts
+        private bool targetLoaded, awaitReload;
         private int settle;
 
         private Vessel switchTarget;
@@ -104,6 +107,34 @@ namespace Seamless
         private CamPose directEnd;          // end pose relative to the target (planning; the flown end is rig.Home())
         private double directSwitchDist, directDirDist, directSwitchU = 1.0, directU0;
         private double lastU;
+
+        // Switch probe: per rendered frame around an in-place switch (3 before, 12 after), what the
+        // cameras and the craft's planet do - for the one-frame jumps seen at the switch.
+        private int probeLeft, probeFrame;
+        private bool probeStarted, probeHasPrev;
+        private Quaternion probePrevRot;
+        private static bool probeHooked;
+        // Frame probe (hidden setting frameProbe): one line per rendered frame while the camera
+        // moves (departure, arrival, Space Center arrival) - frame time, camera step, and where the
+        // planet is drawn on screen, for jitter that a log of milestones cannot show.
+        private int frameN;
+        private string frameAnchor;
+        private bool frameHasPrev;
+        private Vector3 framePrevPx;
+        private Vector3d framePrevCam;
+        private Quaternion framePrevRot;
+
+        // Scaled camera anchored to the arrival craft's planet as drawn: in the frame KSP moves the
+        // floating origin to a newly active craft, the planets' scaled copies and their world
+        // positions disagree by the shift (probe: the planet 18-26 degrees off, gone for a frame).
+        // At the scaled camera's pre-cull (every position final) it is put at the planet's scaled
+        // position plus the camera's offset from the planet, taken from the craft's orbit (or its
+        // surface position when landed) - independent of the origin.
+        private CelestialBody scaledFixBody;
+        private Vector3d scaledFixRel;          // camera - planet centre, world axes, metres
+        private bool scaledFixOn;
+        private static bool scaledFixHooked, scaledFixBroken;
+        private int scaledFixApartRun;
         private bool departApplied;         // the departure has put the camera somewhere (lastCam is valid)
 
         // The opening turn (from the current view to the path's own view) runs on its own clock,
@@ -112,6 +143,12 @@ namespace Seamless
         private double turnW = 1.0;
         private Quaternion turnFix = Quaternion.identity;
         private Vessel inSceneTarget;
+        // The target craft is loaded preloadLeadSeconds before the switch (its load and its parts'
+        // start then cost their own frames instead of one long one at the switch); its own ranges
+        // while its unload range is lifted.
+        private VesselRanges preloadRanges;
+        private bool preloadTried;
+        private const double preloadLeadSeconds = 0.4;
         private static bool stockSwitch;   // the next unloaded-target switch is KSP's own (fallback)
         private float cardEndAt;
         private string LoadKey => kind + " " + targetScene;
@@ -252,6 +289,8 @@ namespace Seamless
             GameEvents.onVesselSwitchingToUnloaded.Add(OnSwitchingToUnloaded);
             GameEvents.onLevelWasLoaded.Add(OnLevelWasLoaded);
             GameEvents.onGameSceneLoadRequested.Add(OnSceneLoadRequested);
+            GameEvents.onGUIApplicationLauncherReady.Add(OnLauncherReady);
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnUnitySceneLoaded;
             Application.logMessageReceived += OnLog;
 
             if (!AppDomain.CurrentDomain.GetAssemblies().Any(a => a.GetName().Name == "0Harmony"))
@@ -276,6 +315,8 @@ namespace Seamless
             GameEvents.onVesselSwitchingToUnloaded.Remove(OnSwitchingToUnloaded);
             GameEvents.onLevelWasLoaded.Remove(OnLevelWasLoaded);
             GameEvents.onGameSceneLoadRequested.Remove(OnSceneLoadRequested);
+            GameEvents.onGUIApplicationLauncherReady.Remove(OnLauncherReady);
+            UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnUnitySceneLoaded;
             Application.logMessageReceived -= OnLog;
         }
 
@@ -287,6 +328,31 @@ namespace Seamless
             RestoreMask();
             if (loadIssued && phase == Phase.Loading && overlay != null && overlay.FrozenUnderUi) SuppressMask();
             if (stockEndPending) { stockEndPending = false; Log.Info("next scene requested before KSP's loading screen ended"); }
+            if (phase == Phase.Loading && loadIssued && targetLoaded && scene == targetScene)
+            {
+                // The new scene is being loaded again while we wait for it (KRASH reverting an
+                // unfinished simulation restarts the game from its Start()): wait for that load,
+                // the first one's objects are about to be destroyed.
+                Log.Info("the " + scene + " scene is being loaded again by the game or another mod - waiting for that load");
+                targetLoaded = false;
+                awaitReload = true;
+                sceneArrived = false;
+                sceneHudHidden = false;
+                usableFrames = 0;
+                settle = 0;
+            }
+        }
+
+        private void OnUnitySceneLoaded(UnityEngine.SceneManagement.Scene s, UnityEngine.SceneManagement.LoadSceneMode mode)
+        {
+            if (mode == UnityEngine.SceneManagement.LoadSceneMode.Additive || !loadIssued || phase != Phase.Loading
+                || s.buildIndex != (int)targetScene) return;
+            targetLoaded = true;
+            if (awaitReload)
+            {
+                awaitReload = false;
+                Log.Info("the " + targetScene + " scene was loaded again");
+            }
         }
 
         private void OnSwitchingToUnloaded(Vessel from, Vessel to)
@@ -297,7 +363,7 @@ namespace Seamless
 
         private void OnLevelWasLoaded(GameScenes scene)
         {
-            if (loadIssued && scene == targetScene) sceneArrived = true;
+            if (loadIssued && scene == targetScene && !awaitReload) sceneArrived = true;
             if (phase != Phase.Idle) hudSceneFrame = Time.frameCount;
         }
 
@@ -649,7 +715,9 @@ namespace Seamless
             string date;
             try { date = KSPUtil.PrintDate(ut, false); } catch { date = ""; }
             titleText = name;
-            detailText = mode + "\n" + date;
+            var saveLines = new List<string> { mode + (string.IsNullOrEmpty(date) ? "" : "   \u00b7   " + date) };
+            saveLines.AddRange(CardFacts.Save(g, ut, kscLat, kscLon));
+            detailText = string.Join("\n", saveLines.ToArray());
             framedBody = null;
             lowerThird = true;
             switchVessel = null;
@@ -1034,6 +1102,7 @@ namespace Seamless
             departFromFlight = fromFlight;
             t = 0;
             loadIssued = sceneArrived = false;
+            targetLoaded = awaitReload = false;
             settle = 0;
             clickAt = Time.realtimeSinceStartup;
             measuring = false;
@@ -1049,6 +1118,17 @@ namespace Seamless
             directFlight = directArrive = false;
             directSwitchU = 1.0;
             departApplied = false;
+            probeStarted = false;
+            preloadTried = false;
+            frameN = 0;
+            frameHasPrev = false;
+            groundWaitFrom = -1;
+            retFromFrameSet = false;
+            rehideUi = false;
+            if (scaledFixBroken) { scaledFixBroken = false; scaledFixApartRun = 0; }   // one bad case must not switch it off for the session
+            if (!scaledFixHooked) { Camera.onPreCull += ScaledFixPreCull; scaledFixHooked = true; }   // before the probe, which reads its result
+            if (S.frameProbe && !probeHooked) { Camera.onPreCull += ProbePreCull; probeHooked = true; }
+            probeLeft = 0;
             turnW = 1.0;
             turnFix = Quaternion.identity;
             Director.AbortActive("scene transition");
@@ -1107,9 +1187,12 @@ namespace Seamless
                 return;
             }
             var inv = System.Globalization.CultureInfo.InvariantCulture;
+            // read / after / the targets are real seconds; the flight's are clock seconds
+            double sp = Speed();
             double T0 = Math.Max(0.1, turnSeconds + travelSeconds);
+            double R0 = T0 / sp;
             double want = read + after - S.cardTargetSeconds;
-            double T = Math.Max(T0, Math.Min(want, Math.Min(read, Math.Max(T0, S.dynamicMaxSeconds))));
+            double T = sp * Math.Max(R0, Math.Min(want, Math.Min(read, Math.Max(R0, S.dynamicMaxSeconds))));
             string how;
             if (T > T0 + 0.05)
             {
@@ -1276,13 +1359,13 @@ namespace Seamless
                 return;
             }
             float t0 = Time.realtimeSinceStartup;
-            VesselRanges saved = target.vesselRanges;
+            scaledFixOn = false;   // the departure's placement; the arrival sets its own
+            bool early = preloadRanges != null && target.loaded;
+            VesselRanges saved = preloadRanges ?? target.vesselRanges;
+            preloadRanges = null;
             try
             {
-                var keep = new VesselRanges(saved);
-                foreach (VesselRanges.Situation s in new[] { keep.prelaunch, keep.landed, keep.splashed, keep.flying, keep.subOrbital, keep.orbit, keep.escaping })
-                    s.unload = float.MaxValue;
-                target.vesselRanges = keep;
+                target.vesselRanges = Lifted(saved);
                 if (!target.loaded) target.Load();
             }
             catch (Exception e) { Log.Warn("loading " + target.vesselName + ": " + e); }
@@ -1297,6 +1380,7 @@ namespace Seamless
             // the departure's camera rig lets go without handing the camera back to the old craft
             try { drv.TakenAway = null; } catch { }
             try { if (drv is CameraRig cr) cr.Release(); else drv.Leave(); } catch { }
+            try { retFromFrame = Planetarium.Rotation; retFromFrameSet = true; } catch { retFromFrameSet = false; }
             Vessel old = FlightGlobals.ActiveVessel;
             bool ok;
             try { ok = FlightGlobals.ForceSetActiveVessel(target); }
@@ -1314,11 +1398,43 @@ namespace Seamless
             loadAt = Time.realtimeSinceStartup;
             measuring = true;
             Unpause();
-            Log.Info(string.Format(inv, "switched in place from {0} to {1}: {2} parts loaded in {3:F2} s, switch done {4:F2} s after the flight ended",
-                old != null ? old.vesselName : "?", target.vesselName, parts, loaded, Time.realtimeSinceStartup - t0));
+            Log.Info(string.Format(inv, "switched in place from {0} to {1}: {2} parts {3}, switch done {4:F2} s after the flight ended",
+                old != null ? old.vesselName : "?", target.vesselName, parts,
+                early ? "loaded ahead" : string.Format(inv, "loaded in {0:F2} s", loaded), Time.realtimeSinceStartup - t0));
             directArrive = directFlight && flightLam != null && flightClock < turnSeconds + travelSeconds;
             directClock = flightClock;
             BeginArrive(target);
+        }
+
+        private static VesselRanges Lifted(VesselRanges r)
+        {
+            var keep = new VesselRanges(r);
+            foreach (VesselRanges.Situation s in new[] { keep.prelaunch, keep.landed, keep.splashed, keep.flying, keep.subOrbital, keep.orbit, keep.escaping })
+                s.unload = float.MaxValue;
+            return keep;
+        }
+
+        /// <summary>Loads the target craft a little before the switch, packed (HoldVessels keeps it
+        /// so) and still far from the camera: its load and its parts' start (the next frame) no
+        /// longer add to the switch's own frame. A failure is left to SwitchInPlace.</summary>
+        private void PreloadTarget()
+        {
+            preloadTried = true;
+            Vessel target = inSceneTarget;
+            if (target == null || target.loaded || target.state == Vessel.State.DEAD || target.protoVessel == null) return;
+            float t0 = Time.realtimeSinceStartup;
+            VesselRanges saved = target.vesselRanges;
+            try
+            {
+                target.vesselRanges = Lifted(saved);
+                target.Load();
+            }
+            catch (Exception e) { Log.Warn("loading " + target.vesselName + " ahead: " + e); }
+            if (!target.loaded) { target.vesselRanges = saved; return; }
+            preloadRanges = saved;
+            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "{0} loaded ahead of the switch in {1:F2} s ({2:F2} s before it)",
+                target.vesselName, Time.realtimeSinceStartup - t0, Math.Max(0.0, TimeAtU(directSwitchU) - t)));
         }
 
         /// <summary>The in-place switch could not be done: KSP's own switch (save, scene reload) runs.</summary>
@@ -1541,6 +1657,8 @@ namespace Seamless
                 }
             }
             catch { }
+            string next = CardFacts.NextEvent(v);
+            if (next != null) lines.Add(next);
             int crew = 0;
             try { crew = v.loaded ? v.GetCrewCount() : (v.protoVessel != null ? v.protoVessel.GetVesselCrew().Count : 0); } catch { }
             if (crew > 0) lines.Add(crew + (crew == 1 ? " Kerbal aboard" : " Kerbals aboard"));
@@ -1603,14 +1721,26 @@ namespace Seamless
             try { ApplyCurrent(false); } catch { }
         }
 
+        /// <summary>The transition clock's step this frame: the frame time (at most 1/30 s, so a stall
+        /// pauses the move instead of jumping it) divided by transitionTimeScale. Every leg runs
+        /// on this clock (flights, zooms, holds, card fades); waits for the scene and their
+        /// time-outs are counted in real seconds (Speed() back out where they use the clock).
+        /// transitionTimeScale is a duration scale: 1.5 = every leg takes 1.5 x as long.</summary>
+        private double Tick() { return Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0) * Speed(); }
+        private double Speed() { return S != null ? 1.0 / Math.Max(0.25, (double)S.transitionTimeScale) : 1.0; }
+
         private void Step()
         {
             switch (phase)
             {
                 case Phase.Depart:
-                    t += Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0);
+                    t += Tick();
                     WatchMusic();
                     HoldVessels();
+                    if (S.frameProbe && directFlight && departApplied && !probeStarted && FlightU(t + 0.05) >= directSwitchU) StartSwitchProbe();
+                    if (inSceneSwitch && directFlight && departApplied && !preloadTried
+                        && FlightU(t + preloadLeadSeconds * Speed()) >= directSwitchU && FlightU(t) < directSwitchU)
+                        PreloadTarget();
                     if (inSceneSwitch && (!departAlive() || t >= turnSeconds + travelSeconds || (directFlight && departApplied && FlightU(t) >= directSwitchU)))
                     { SwitchInPlace(); break; }
                     if (!departAlive()) { Freeze(false); break; }
@@ -1655,7 +1785,7 @@ namespace Seamless
                     break;
 
                 case Phase.Reveal:
-                    t += Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0);
+                    t += Tick();
                     RevealFrame();
                     break;
             }
@@ -1684,8 +1814,38 @@ namespace Seamless
             if (HighLogic.LoadedScene == GameScenes.SPACECENTER && drv is CameraRig)
                 KscTerrainSwitch(FlightGlobals.GetHomeBody(), cam);
             lastCam = cam; lastRot = rot; lastTanV = tanV;
+            SetDepartScaledFix(cam);
             if (withOverlay)
                 overlay.Apply(DepartCard(cam, rot, tanV));
+        }
+
+        /// <summary>The departure's scaled camera placed from the camera pose itself (double
+        /// precision, this frame), against the planet that looks biggest from there. Left to KSP it
+        /// follows the local camera's float position - millions of km from the origin on a long
+        /// flight - and a frame late: the planet sat 0.2-0.5 deg off and jumped ~1.4 deg (25-30 px)
+        /// on every slow frame (frame probe, flight -> Space Center, 2026-11-26).</summary>
+        private void SetDepartScaledFix(Vector3d cam)
+        {
+            scaledFixOn = false;
+            try
+            {
+                CelestialBody best = null;
+                double bestK = double.MaxValue;
+                var bodies = FlightGlobals.Bodies;
+                for (int i = 0; i < bodies.Count; i++)
+                {
+                    CelestialBody b = bodies[i];
+                    if (b == null || b.scaledBody == null || b.Radius <= 0) continue;
+                    double k = (cam - b.position).magnitude / b.Radius;
+                    if (k < bestK) { bestK = k; best = b; }
+                }
+                if (best == null) return;
+                scaledFixBody = best;
+                scaledFixRel = cam - best.position;
+                scaledFixOn = true;
+                if (!scaledFixHooked) { Camera.onPreCull += ScaledFixPreCull; scaledFixHooked = true; }
+            }
+            catch { scaledFixOn = false; }
         }
 
         /// <summary>The departure's camera pose at path position u (0..1): the turn (to departMid)
@@ -1844,6 +2004,12 @@ namespace Seamless
                 Vector3d Pt = TravelCenter();
                 bool one = travelBody == departBody;
                 Vector3d prevCam = Vector3d.zero; Vector3 prevFwd = Vector3.forward; double prevTan = 1.0, prevNear = 1.0;
+                // Leaving a craft: the pull-away from it counts too (up to 20 times the starting
+                // distance). Measured only against the planets, the first tens of km cost nothing,
+                // and the craft vanished in the first frames, before the camera seemed to move.
+                double craft0 = Math.Max(1.0, departStart.Off.magnitude);
+                bool fromCraft = departFromFlight && departVessel != null;
+                double prevCraft = craft0;
                 for (int i = 0; i < n; i++)
                 {
                     double u = (double)i / (n - 1);
@@ -1852,15 +2018,17 @@ namespace Seamless
                     if (!one) near = Math.Min(near, (cam - Po).magnitude);
                     near = Math.Max(1.0, near);
                     Vector3 fwd = rot * Vector3.forward;
+                    double craftD = fromCraft ? Math.Max(craft0, Math.Min(20.0 * craft0, (cam - anchor).magnitude)) : craft0;
                     if (i == 0) lam[i] = 0.0;
                     else
                     {
                         double step = Math.Abs(Math.Log(near / prevNear))
                                       + Vector3.Angle(prevFwd, fwd) * Math.PI / 180.0
-                                      + Math.Abs(Math.Log(tanV / prevTan));
+                                      + Math.Abs(Math.Log(tanV / prevTan))
+                                      + Math.Abs(Math.Log(craftD / prevCraft));
                         lam[i] = lam[i - 1] + step;
                     }
-                    prevCam = cam; prevFwd = fwd; prevTan = tanV; prevNear = near;
+                    prevCam = cam; prevFwd = fwd; prevTan = tanV; prevNear = near; prevCraft = craftD;
                 }
                 double L = lam[n - 1];
                 double V = Math.Max(0.1, S.flightMaxRate), A = Math.Max(0.05, S.flightMaxAccel);
@@ -2021,7 +2189,7 @@ namespace Seamless
             {
                 bool usable = sceneArrived && (Usable() || Ready());
                 usableFrames = usable ? usableFrames + 1 : 0;
-                go = usableFrames >= 5 && smooth >= 3;
+                go = usableFrames >= 5 && smooth >= 3 && !GroundNotReady();
             }
             else
             {
@@ -2043,6 +2211,25 @@ namespace Seamless
             else
                 BeginReveal();
         }
+
+        /// <summary>A switch to a craft on or near the ground: KSP keeps it packed until the terrain
+        /// under it is built. Shown before that, the card's shot had holes where the terrain was
+        /// not drawn yet (2026-11-26); the zoom waits for the unpacking anyway, so the frozen card
+        /// stays until then (at most 10 s after the scene could be shown).</summary>
+        private bool GroundNotReady()
+        {
+            if (kind != Kind.VesselSwitch || targetScene != GameScenes.FLIGHT) return false;
+            Vessel av = FlightGlobals.ActiveVessel;
+            if (av == null || av.id != targetId || !Shots.SurfaceLike(av)) return false;
+            if (!av.packed || HeldByPhysicsHold(av) || Ready()) return false;
+            if (groundWaitFrom < 0)
+            {
+                groundWaitFrom = t;
+                Log.Info("the craft is on the ground: the card stays until KSP has built the terrain under it");
+            }
+            return t - groundWaitFrom <= 10.0;
+        }
+        private double groundWaitFrom = -1;
 
         /// <summary>The new scene can be shown and driven (not yet finished loading).</summary>
         private bool Usable()
@@ -2094,6 +2281,10 @@ namespace Seamless
         private void BeginArrive(Vessel v)
         {
             FlightCamera fc = FlightCamera.fetch;
+            // the camera's frame for this craft now, not after the hand-back: the arrival ends on
+            // the camera's own pose in that frame
+            string fr = CameraRig.SnapFrame(fc, v);
+            if (fr != null) Log.Info("camera frame of reference " + fr + " for " + v.vesselName);
             rig = new CameraRig(S, fc);
             retakes = 0;
             retakeRequested = false;
@@ -2183,6 +2374,14 @@ namespace Seamless
         }
 
         private double directClock;
+        // KSP's world frame when retFrom was planned (Planetarium.Rotation). A switch between a
+        // craft in a rotating frame (landed, or low) and one that is not turns every world
+        // position about the old planet a frame or two later; the arrival path turns with it.
+        private QuaternionD retFromFrame;
+        private bool retFromFrameSet;
+        // KSP re-shows some mods' windows when the scene's toolbar comes up (Kerbalism); hidden
+        // again on the next frame while a transition keeps the UI hidden.
+        private bool rehideUi;
 
         /// <summary>The arrival of a direct flight: the zoom from the planet shot to the craft's own
         /// camera view, on the departure's clock (same profile, no stop). The flight camera is set
@@ -2193,6 +2392,7 @@ namespace Seamless
             liveAt = 0;
             waitUnpack = false;
             retFrom = estPose(anchor);
+            RebaseRetFrom();
             directU0 = Math.Min(0.999, lastU);
             try
             {
@@ -2210,6 +2410,29 @@ namespace Seamless
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                 "zooming straight in: {0:F1} s to the craft's view ({1:F0} m){2}", retDur, rig.Fc.Distance,
                 arrivePlan != null ? ", around " + b.bodyName : ""));
+        }
+
+        /// <summary>Turns retFrom (a pose relative to the craft, in world axes) with KSP's world frame
+        /// when that has turned since it was planned: the rotating frame of a landed or low craft
+        /// switched off (or on) at an in-place switch. Without it the camera jumped (Explorer I on
+        /// the Mun -> Datalink II in Kerbin orbit, 2026-11-26).</summary>
+        private void RebaseRetFrom()
+        {
+            if (!retFromFrameSet) return;
+            try
+            {
+                QuaternionD now = Planetarium.Rotation;
+                QuaternionD c = now * QuaternionD.Inverse(retFromFrame);
+                double ang = Quaternion.Angle(Quaternion.identity, (Quaternion)c);
+                if (ang < 1e-4) return;
+                retFrom = new CamPose(c * retFrom.Off, (Quaternion)c * retFrom.Rot, retFrom.TanV);
+                retFromFrame = now;
+                if (ang > 0.01)
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "KSP's world frame turned {0:F2} deg after the switch (rotating frame {1}) - the arrival path turned with it",
+                        ang, FlightGlobals.RefFrameIsRotating ? "on" : "off"));
+            }
+            catch { retFromFrameSet = false; }
         }
 
         /// <summary>The distance FlightCamera backs off to on a vessel switch (AdjustDistanceToFit).</summary>
@@ -2275,9 +2498,203 @@ namespace Seamless
                 DepartPoseAt(u, anchor, out Vector3d cam, out _, out _, out _);
                 if ((cam - tp).magnitude <= directSwitchDist) { directSwitchU = u; break; }
             }
+            // Not before the opening turn has the camera facing the craft: the arrival flies on
+            // along the view it is handed, so a switch at once (a craft orbiting the Sun, whose
+            // switch distance is millions of km) kept the old shot's direction for the whole flight.
+            double T = turnSeconds + travelSeconds;
+            double turnEnd = S.departTurnSeconds + 0.2;
+            if (T > turnEnd + 1.0)
+                directSwitchU = Math.Max(directSwitchU, FlightU(turnEnd));
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                 "direct to the craft: switch {0:F0} km out at {1:F1} s of {2:F1} s, ending {3:F0} m away",
                 directSwitchDist / 1000.0, TimeAtU(directSwitchU), turnSeconds + travelSeconds, directEnd.Off.magnitude));
+        }
+
+        /// <summary>The camera's offset from the craft's planet, from the craft's own orbit (or its
+        /// surface position) - not from the planet's world position, which is briefly off by the
+        /// origin shift in the frame a craft becomes active.</summary>
+        private void SetScaledFix(Vessel v, Vector3d cam)
+        {
+            scaledFixOn = false;
+            try
+            {
+                CelestialBody b = v != null ? v.mainBody : null;
+                if (b == null || b.scaledBody == null) return;
+                if (scaledFixBroken) return;
+                Vector3d rel;
+                if (v.LandedOrSplashed || v.situation == Vessel.Situations.PRELAUNCH || v.orbit == null || FlightGlobals.RefFrameIsRotating)
+                    // in world axes (GetRelSurfacePosition alone is in the body's own frame: a
+                    // landed craft came out one planet radius off and switched this off)
+                    rel = b.GetWorldSurfacePosition(v.latitude, v.longitude, v.altitude) - b.position;
+                else
+                    rel = v.orbit.pos.xzy;
+                // Safety net: this must agree with the world positions except in the odd frame of an
+                // origin shift. Apart for several frames in a row = the formula is wrong here: off.
+                Vector3d world = v.GetWorldPos3D() - b.position;
+                double apart = (rel - world).magnitude;
+                if (apart > 1000.0 + 0.002 * world.magnitude)
+                {
+                    scaledFixApartRun++;
+                    if (scaledFixApartRun == 1)
+                        Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "scaled camera: {0} is {1:F0} km from where {2}'s orbit puts it this frame - placed by the orbit",
+                            b.bodyName, apart / 1000.0, v.vesselName));
+                    if (scaledFixApartRun >= 5)
+                    {
+                        scaledFixBroken = true;
+                        Log.Warn(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "scaled camera: the craft's orbit and the world positions stay {0:F0} km apart - placement by the orbit switched off",
+                            apart / 1000.0));
+                        return;
+                    }
+                }
+                else scaledFixApartRun = 0;
+                scaledFixBody = b;
+                scaledFixRel = rel + (cam - v.GetWorldPos3D());
+                scaledFixOn = true;
+                if (!scaledFixHooked) { Camera.onPreCull += ScaledFixPreCull; scaledFixHooked = true; }
+            }
+            catch { scaledFixOn = false; }
+        }
+
+        private static void ScaledFixPreCull(Camera c)
+        {
+            Transitions tr = instance;
+            if (tr == null || !tr.scaledFixOn || (tr.phase != Phase.Arrive && tr.phase != Phase.Depart && tr.phase != Phase.Capture)) return;
+            ScaledCamera sc = ScaledCamera.Instance;
+            if (sc == null || c != sc.cam || tr.scaledFixBody == null || tr.scaledFixBody.scaledBody == null) return;
+            try
+            {
+                sc.transform.position = (Vector3)((Vector3d)tr.scaledFixBody.scaledBody.transform.position
+                                                  + tr.scaledFixRel * ScaledSpace.InverseScaleFactor);
+            }
+            catch { tr.scaledFixOn = false; }
+        }
+
+        private void StartSwitchProbe()
+        {
+            probeStarted = true;
+            probeLeft = 15;
+            probeFrame = 0;
+            probeHasPrev = false;
+            if (!probeHooked) { Camera.onPreCull += ProbePreCull; probeHooked = true; }
+        }
+
+        /// <summary>Runs as the scaled-space camera starts rendering: positions are final for the frame.</summary>
+        private static void ProbePreCull(Camera c)
+        {
+            Transitions tr = instance;
+            if (tr == null) return;
+            bool frames = tr.S.frameProbe && (tr.phase == Phase.Depart || tr.phase == Phase.Arrive || tr.phase == Phase.ArriveKsc);
+            if (frames && tr.phase == Phase.Depart && tr.scaledFixOn && tr.scaledFixBody != null)
+                tr.frameAnchor = tr.scaledFixBody.bodyName;
+            if (tr.probeLeft <= 0 && !frames) return;
+            ScaledCamera sc = ScaledCamera.Instance;
+            if (sc == null || c != sc.cam) return;
+            if (tr.probeLeft > 0)
+            {
+                try { tr.ProbeLog(sc); }
+                catch (Exception e) { tr.probeLeft = 0; Log.Warn("switch probe: " + e.Message); }
+            }
+            if (frames)
+            {
+                try { tr.FrameLog(sc); }
+                catch (Exception e) { Log.Warn("frame probe: " + e.Message); }
+            }
+        }
+
+        /// <summary>One frame of the frame probe. The planet is the one the move is about: the
+        /// arrival craft's, else the flight's destination planet. "px" is where the scaled camera
+        /// draws it; "local/scaled" how far apart its direction is in local and scaled space.</summary>
+        private void FrameLog(ScaledCamera sc)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            Camera main = Camera.main;
+            Vessel tv = arriveVessel != null ? arriveVessel : (inSceneTarget != null ? inSceneTarget : switchVessel);
+            CelestialBody b = phase == Phase.Arrive && tv != null ? tv.mainBody
+                            : travelBody != null ? travelBody : FlightGlobals.currentMainBody;
+            Vector3d lp = main != null ? (Vector3d)main.transform.position : Vector3d.zero;
+            Quaternion lr = main != null ? main.transform.rotation : sc.transform.rotation;
+            if (phase == Phase.Depart || phase == Phase.Capture) lp = lastCam;   // the pose as planned (double), not its float copy
+            string planet = "no planet";
+            Vector3 px = Vector3.zero;
+            bool havePx = false;
+            if (b != null && b.scaledBody != null)
+            {
+                Vector3 sp = sc.transform.position;
+                px = sc.cam.WorldToScreenPoint(b.scaledBody.transform.position);
+                havePx = true;
+                double err = main != null ? AngleDeg(b.position - lp, (Vector3d)b.scaledBody.transform.position - (Vector3d)sp) : -1.0;
+                double dpx = frameHasPrev ? (Vector2.Distance(new Vector2(px.x, px.y), new Vector2(framePrevPx.x, framePrevPx.y))) : 0.0;
+                planet = string.Format(inv, "{0} at ({1:F1}, {2:F1}) px{3}, moved {4:F1} px, local/scaled {5:F3} deg, {6:F0} km away",
+                    b.bodyName, px.x, px.y, px.z < 0 ? " (behind)" : "", dpx, err, (b.position - lp).magnitude / 1000.0);
+            }
+            double turn = frameHasPrev ? Quaternion.Angle(framePrevRot, lr) : 0.0;
+            double moved = frameHasPrev ? (lp - framePrevCam).magnitude : 0.0;
+            Log.Info(string.Format(inv,
+                "frame {0}: {1}, dt {2:F3} s, t {3:F3}, u {4:F4}, camera turned {5:F3} deg, moved {6:F0} m, {7}, camera {8:F0} km from the origin{9}",
+                frameN, phase, Time.unscaledDeltaTime, t, phase == Phase.Depart ? FlightU(t) : -1.0, turn, moved, planet, lp.magnitude / 1000.0,
+                phase == Phase.Depart && scaledFixOn && frameAnchor != null ? ", scaled camera placed from " + frameAnchor : ""));
+            frameN++;
+            framePrevRot = lr;
+            framePrevCam = lp;
+            if (havePx) framePrevPx = px;
+            frameHasPrev = true;
+        }
+
+        private static double AngleDeg(Vector3d a, Vector3d b)
+        {
+            double la = a.magnitude, lb = b.magnitude;
+            if (la < 1e-12 || lb < 1e-12) return -1.0;
+            return Math.Acos(Math.Max(-1.0, Math.Min(1.0, Vector3d.Dot(a, b) / (la * lb)))) * 180.0 / Math.PI;
+        }
+
+        private void ProbeLog(ScaledCamera sc)
+        {
+            probeLeft--;
+            FlightCamera fc = FlightCamera.fetch;
+            if (fc == null) return;
+            Transform lc = fc.transform;
+            Vessel tv = arriveVessel != null ? arriveVessel : (inSceneTarget != null ? inSceneTarget : switchVessel);
+            CelestialBody b = tv != null ? tv.mainBody : travelBody;
+            Vector3d lp = lc.position;
+            Quaternion lr = lc.rotation;
+            Vector3d sp = sc.transform.position;
+            Quaternion sr = sc.transform.rotation;
+            double turn = probeHasPrev ? Quaternion.Angle(probePrevRot, lr) : 0.0;
+            double camsApart = Quaternion.Angle(lr, sr);
+            double planetErr = -1.0;
+            bool terrain = false;
+            double drawnErr = -1.0;
+            if (b != null)
+            {
+                if (b.scaledBody != null)
+                {
+                    planetErr = AngleDeg(b.position - lp, (Vector3d)b.scaledBody.transform.position - sp);
+                    if (scaledFixOn && ReferenceEquals(b, scaledFixBody))
+                        drawnErr = AngleDeg(-scaledFixRel, (Vector3d)b.scaledBody.transform.position - sp);
+                }
+                terrain = b.pqsController != null && b.pqsController.isActive;
+            }
+            double craftOff = -1.0, craftKm = -1.0;
+            if (tv != null)
+            {
+                Vector3d to = tv.GetWorldPos3D() - lp;
+                craftOff = AngleDeg((Vector3d)(lr * Vector3.forward), to);
+                craftKm = to.magnitude / 1000.0;
+            }
+            Vessel av = FlightGlobals.ActiveVessel;
+            double originM = av != null ? ((Vector3d)av.transform.position).magnitude : -1.0;
+            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "switch probe {0}: {1}, frame dt {2:F3} s, u {3:F4}, view turned {4:F2} deg, local/scaled cameras {5:F2} deg apart, "
+                + "{6} {7:F3} deg apart in local / scaled space ({14:F3} deg from where the craft's orbit puts it), terrain {8}, craft {9:F1} deg from centre {10:F0} km away, "
+                + "active craft {11} {12:F0} m from the origin, rotating frame {13}",
+                probeFrame, phase, Time.unscaledDeltaTime, FlightU(t), turn, camsApart,
+                b != null ? b.bodyName : "?", planetErr, terrain ? "on" : "off", craftOff, craftKm,
+                av != null ? av.vesselName : "?", originM, FlightGlobals.RefFrameIsRotating, drawnErr));
+            probePrevRot = lr;
+            probeHasPrev = true;
+            probeFrame++;
         }
 
         /// <summary>Flight time at path position u (the inverse of FlightU).</summary>
@@ -2305,7 +2722,7 @@ namespace Seamless
 
         private void ArriveStep()
         {
-            t += Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0);
+            t += Tick();
             Vessel v = arriveVessel;
             if (v == null || FlightGlobals.ActiveVessel != v || rig.Fc != FlightCamera.fetch) { EndArrive("vessel or camera gone"); return; }
             if (MapView.MapIsEnabled || (CameraManager.Instance != null && CameraManager.Instance.currentCameraMode != CameraManager.CameraMode.Flight))
@@ -2335,7 +2752,7 @@ namespace Seamless
                 double live = t - liveAt;
                 if (live > 0.5 && (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)))
                     StartReturn(Math.Min(S.zoomInSeconds, 2.0));
-                else if (live >= S.establishSeconds && (smooth >= 3 || live > 45.0 || !S.liveLoading))
+                else if (live >= S.establishSeconds && (smooth >= 3 || live > 45.0 * Speed() || !S.liveLoading))
                 {
                     Milestone("zoom in");
                     StartReturn(S.zoomInSeconds);
@@ -2399,6 +2816,7 @@ namespace Seamless
         {
             if (directArrive && retStart >= 0)
             {
+                RebaseRetFrom();
                 double u = FlightU(t);
                 double sd = Math.Max(0.0, Math.Min(1.0, (u - directU0) / (1.0 - directU0)));
                 skyWeight = 1.0 - sd;
@@ -2446,6 +2864,11 @@ namespace Seamless
             Vector3d anchor = rig.Anchor(v);
             CamPose p = ArrivePose(anchor);
             Vector3d cam = CameraRig.ClampAltitude(anchor + p.Off, anchor, v.mainBody);
+            // An in-place switch arrives on a craft in space: its planet stays the distant model
+            // while the camera is above the terrain altitude (as in flight by the camera), from the
+            // switch frame on - the terrain switched on far out drew a one-frame jump at the switch.
+            if (directArrive) KscTerrainSwitch(v.mainBody, cam);
+            SetScaledFix(v, cam);
             if (kind == Kind.Launch)
             {
                 // the flight from the building's entrance stays above the ground; the floor lets go
@@ -2659,7 +3082,7 @@ namespace Seamless
 
         private void KscStep()
         {
-            t += Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0);
+            t += Tick();
             if (kscRig == null || kscCt == null || kscRig.Fc != FlightCamera.fetch || HighLogic.LoadedScene != GameScenes.SPACECENTER)
             { EndKsc("camera or scene gone"); return; }
             KeepHudOff();
@@ -2670,22 +3093,22 @@ namespace Seamless
             // First, under the card, the camera waits at the Space Center's own view until that
             // has settled (terrain, clouds, atmosphere built there: they popped in as the zoom
             // arrived); then it goes out to the planet shot, which settles in turn.
-            if (kscWarmDoneAt < 0 && ((t >= S.warmUpSeconds && Settled()) || t > S.settleMaxSeconds))
+            if (kscWarmDoneAt < 0 && ((t >= S.warmUpSeconds && Settled()) || t > S.settleMaxSeconds * Speed()))
             {
                 kscWarmDoneAt = t;
-                Milestone(t > S.settleMaxSeconds ? "Space Center view still busy, going on" : "Space Center view built");
+                Milestone(t > S.settleMaxSeconds * Speed() ? "Space Center view still busy, going on" : "Space Center view built");
             }
             // the planet shot itself needs no settling of its own (the terrain is off up there):
             // the card goes as soon as the Space Center view is built
             if (kscWarmDoneAt >= 0 && kscSettledAt < 0)
             {
                 kscSettledAt = t;
-                Milestone((t > kscWarmDoneAt + S.settleMaxSeconds ? "scene still busy, going on" : "scene settled")
+                Milestone((t > kscWarmDoneAt + S.settleMaxSeconds * Speed() ? "scene still busy, going on" : "scene settled")
                           + (logRepeatsIgnored > 0 ? " (" + logRepeatsIgnored + " repeated log lines not counted)" : ""));
             }
             if (retStart < 0 && t > 0.5 && (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)))
             { if (kscWarmDoneAt < 0) kscWarmDoneAt = t; if (kscSettledAt < 0) kscSettledAt = t; retStart = t; retDur = Math.Min(S.zoomInSeconds, 2.0); PlanKsc(); }
-            else if (retStart < 0 && kscSettledAt >= 0 && t >= kscSettledAt + hold && (smooth >= 3 || t > kscSettledAt + hold + 45.0 || !S.liveLoading))
+            else if (retStart < 0 && kscSettledAt >= 0 && t >= kscSettledAt + hold && (smooth >= 3 || t > kscSettledAt + hold + 45.0 * Speed() || !S.liveLoading))
             {
                 // the shot holds while the game still stalls finishing its load
                 Milestone("zoom down");
@@ -2825,8 +3248,8 @@ namespace Seamless
         internal static bool HoldsTerrainOff(PQS pqs)
         {
             Transitions t = instance;
-            if (t == null || pqs == null || !ReferenceEquals(pqs, t.kscPqs) || pqs.isActive
-                || HighLogic.LoadedScene != GameScenes.SPACECENTER) return false;
+            if (t == null || pqs == null || !ReferenceEquals(pqs, t.kscPqs) || pqs.isActive) return false;
+            if (HighLogic.LoadedScene != GameScenes.SPACECENTER && !(HighLogic.LoadedSceneIsFlight && t.directArrive)) return false;
             t.kscPqsHeld++;
             return true;
         }
@@ -2883,7 +3306,10 @@ namespace Seamless
         /// <summary>The terrain is on again whatever happened (the Space Center needs it).</summary>
         private void KscTerrainOn()
         {
-            try { if (kscPqs != null && !kscPqs.isActive) kscPqs.ActivateSphere(); } catch { }
+            // the Space Center needs its terrain; in flight KSP's own check takes over again
+            // (the craft in space keeps the distant planet unless it is low enough for terrain)
+            if (!HighLogic.LoadedSceneIsFlight)
+                try { if (kscPqs != null && !kscPqs.isActive) kscPqs.ActivateSphere(); } catch { }
             if (kscPqs != null && kscPqsHeld > 0)
                 Log.Info("terrain back on (KSP's own terrain update was held off for " + kscPqsHeld + " frames while it was off)");
             kscPqsHeld = 0;
@@ -3053,6 +3479,11 @@ namespace Seamless
             uiHidden = true;
         }
 
+        private void OnLauncherReady()
+        {
+            if (phase != Phase.Idle && uiHidden) rehideUi = true;
+        }
+
         /// <summary>Re-hide the canvases every frame while the card covers the scene: the game's
         /// loading mask re-shows them (ShowUI at the end of its show duration), bypassing the event.</summary>
         private void KeepHudOff()
@@ -3066,6 +3497,13 @@ namespace Seamless
                     ui.HideUI();
             }
             catch { }
+            if (rehideUi)
+            {
+                // a frame after the toolbar came up, when mods that show their windows on it
+                // (Kerbalism) have done so
+                rehideUi = false;
+                try { GameEvents.onHideUI.Fire(); } catch (Exception e) { Log.Warn("hide HUDs: " + e.Message); }
+            }
             uiHidden = true;
         }
 
@@ -3125,8 +3563,15 @@ namespace Seamless
             riseRequired = false;
             staticDepart = false;
             inSceneSwitch = false;
+            if (preloadRanges != null && inSceneTarget != null)
+                try { inSceneTarget.vesselRanges = preloadRanges; } catch { }   // loaded ahead, never switched to
+            preloadRanges = null;
+            preloadTried = false;
             inSceneTarget = null;
             directFlight = directArrive = false;
+            scaledFixOn = false;
+            scaledFixBody = null;
+            scaledFixApartRun = 0;
             departVessel = null;
             arriveVessel = null;
             switchVessel = null;

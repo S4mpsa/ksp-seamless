@@ -77,10 +77,12 @@ namespace Seamless
             if (body.isStar)
             {
                 // A star is not framed like a planet from far off (a telephoto shot of the sun is a
-                // blinding disc): the camera stays by the craft at the normal field of view, the star
-                // at its true size from there - framed only when the craft is that close anyway.
+                // blinding disc): the camera stays near the craft at the normal field of view, the
+                // star at its true size from there - framed only when the craft is that close anyway.
+                // starShotZoomOut times the vessel-size distance: at that distance alone the craft
+                // popped in at a tenth of the screen and the arrival had hardly any zoom left.
                 if (dFar >= c.Rv + lFar) return Far(c, tanV0, dFar);
-                Shot natural = Near(c, tanV0, true);
+                Shot natural = Near(c, tanV0, true, s.starShotZoomOut);
                 if (natural != null) return natural;
             }
             // High orbits: the camera pulls back (the planet smaller) until the vessel's distance from
@@ -272,10 +274,10 @@ namespace Seamless
 
         // ------------------------------------------------------------------ near
 
-        private static Shot Near(Ctx c, double tanV0, bool naturalSize = false)
+        private static Shot Near(Ctx c, double tanV0, bool naturalSize = false, double zoomOut = 1.0)
         {
             double tanV = tanV0, d = 0, L = 0, gamma = 0;
-            if (naturalSize) L = c.Size / (2.0 * tanV * c.S.vesselFraction);
+            if (naturalSize) L = zoomOut * c.Size / (2.0 * tanV * c.S.vesselFraction);
             for (int i = 0; i < (naturalSize ? 0 : 12); i++)
             {
                 Vector3d rp = Ray(c.Sx, 0, tanV, c.Aspect);

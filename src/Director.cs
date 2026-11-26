@@ -30,8 +30,10 @@ namespace Seamless
         private Vessel watched;
         private CelestialBody watchedBody;
         private float quiet;
-        private float settled;     // time since the last SOI change / rails (EVE, Scatterer load the body then)
+        private float settled;     // time since the last SOI change (EVE, Scatterer load the body then)
+        private float offRails;    // time since the craft came off rails (time warp ended)
         private const float SettleSeconds = 5f;
+        private const float OffRailsSeconds = 1f;
         private List<ModuleEngines> engines = new List<ModuleEngines>();
         private float engineScanAge = 999f;
         private float lastNote = -999f;
@@ -69,12 +71,14 @@ namespace Seamless
             Vessel v = FlightGlobals.ActiveVessel;
             if (v == null || v.mainBody == null) return;
 
-            if (v != watched) { watched = v; quiet = 0f; settled = 0f; engineScanAge = 999f; }
+            if (v != watched) { watched = v; quiet = 0f; settled = 0f; offRails = 0f; engineScanAge = 999f; }
             // Separately from the engines-off wait, the shot never starts within SettleSeconds of an
-            // SOI change or of being on rails (EVE / Scatterer load the new body then, which stalls
-            // frames; a pack / unpack moves things).
+            // SOI change (EVE / Scatterer load the new body then, which stalls frames) or within
+            // OffRailsSeconds of time warp ending (a pack / unpack moves things). It was 5 s after
+            // either: a short insertion burn right after warping to the node waited ~5 s.
             if (v.mainBody != watchedBody) { watchedBody = v.mainBody; quiet = 0f; settled = 0f; }
-            if (v.packed) settled = 0f; else settled += Time.deltaTime;
+            settled += Time.deltaTime;
+            if (v.packed) offRails = 0f; else offRails += Time.deltaTime;
             engineScanAge += Time.deltaTime;
             if (engineScanAge > 2f)
             {
@@ -96,7 +100,7 @@ namespace Seamless
             tracker.EnsureSeeded();
 
             CelestialBody b = v.mainBody;
-            if (quiet < S.quietSeconds || settled < SettleSeconds) return;
+            if (quiet < S.quietSeconds || settled < SettleSeconds || offRails < OffRailsSeconds) return;
             if (tracker.HasVisited(b)) return;
             if (b.isStar && !S.includeStars) return;
             if (!Arrived(v, b)) return;

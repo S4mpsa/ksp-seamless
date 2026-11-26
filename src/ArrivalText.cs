@@ -53,6 +53,7 @@ namespace Seamless
                 string mt = MissionTime(v.missionTime);
                 if (mt != null) lines.Add(mt);
             }
+            if (s.showPlanetFacts) lines.AddRange(CardFacts.Planet(b));
             return string.Join("\n", lines.ToArray());
         }
 

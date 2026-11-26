@@ -25,7 +25,8 @@ namespace Seamless
         public float maxSunAngle = 50f;      // far shots: camera at most this far from the planet's lit side
         public bool sunFromTextSide = true;  // far shots: sun beside the camera on the text side
         public float sunSideAngle = 53f;     // ... this many degrees from the camera (53: a fifth of the disc dark)
-        public float maxZoomOut = 4f;        // far shots may pull back this many times further to show a high vessel
+        public float maxZoomOut = 4f;
+        public float starShotZoomOut = 15f;  // hidden: a craft orbiting a star: the card shot this many times further out than the vessel-size distance        // far shots may pull back this many times further to show a high vessel
         public float pushIn = 0.04f;         // slow zoom while holding (fraction of the FOV)
         public float skyboxBrightness = 0.35f; // skybox brightness during the shot (1 = unchanged)
         public float skyboxMinFov = 25f;     // the skybox is never zoomed in further than this
@@ -79,6 +80,9 @@ namespace Seamless
         public KeyCode previewKey = KeyCode.KeypadMultiply;
 
         public bool debugLog = false;
+        public float transitionTimeScale = 1f;   // every leg of the transitions takes this many times as long (1 = as designed, 1.5 = slower)
+        public bool showPlanetFacts = true;   // hidden: radius, gravity, atmosphere, day, moons on the arrival card
+        public bool frameProbe = false;   // hidden: one log line per rendered frame of every camera move
 
         public static Settings Load()
         {
@@ -120,6 +124,7 @@ namespace Seamless
                 Bool(n, "sunFromTextSide", ref s.sunFromTextSide);
                 Float(n, "sunSideAngle", ref s.sunSideAngle);
                 Float(n, "maxZoomOut", ref s.maxZoomOut);
+                Float(n, "starShotZoomOut", ref s.starShotZoomOut);
                 Float(n, "pushIn", ref s.pushIn);
                 Float(n, "skyboxBrightness", ref s.skyboxBrightness);
                 Float(n, "skyboxMinFov", ref s.skyboxMinFov);
@@ -164,6 +169,9 @@ namespace Seamless
                 Key(n, "skipKey", ref s.skipKey);
                 Key(n, "previewKey", ref s.previewKey);
                 Bool(n, "debugLog", ref s.debugLog);
+                Float(n, "transitionTimeScale", ref s.transitionTimeScale);
+                Bool(n, "showPlanetFacts", ref s.showPlanetFacts);
+                Bool(n, "frameProbe", ref s.frameProbe);
             }
             catch (Exception e)
             {
@@ -187,6 +195,8 @@ namespace Seamless
             maxSunAngle = Mathf.Clamp(maxSunAngle, 0f, 180f);
             sunSideAngle = Mathf.Clamp(sunSideAngle, 0f, 90f);
             maxZoomOut = Mathf.Clamp(maxZoomOut, 1f, 20f);
+            transitionTimeScale = Mathf.Clamp(transitionTimeScale, 0.25f, 4f);
+            starShotZoomOut = Mathf.Clamp(starShotZoomOut, 1f, 200f);
             pushIn = Mathf.Clamp(pushIn, 0f, 0.5f);
             skyboxBrightness = Mathf.Clamp01(skyboxBrightness);
             skyboxMinFov = Mathf.Clamp(skyboxMinFov, 0f, 120f);
