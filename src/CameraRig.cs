@@ -252,7 +252,16 @@ namespace Seamless
         public static bool ProjectMarker(Vector3d cam, Quaternion rot, double tanV, Vector3d vesselPos, double vesselSize,
                                          CelestialBody body, double barFraction, out Vector2 screen)
         {
+            return ProjectMarker(cam, rot, tanV, vesselPos, vesselSize, body, barFraction, out screen, out _);
+        }
+
+        /// <summary>As above; <paramref name="fade"/> (1..0) takes the ring away as the craft itself
+        /// becomes visible (about 1 to 2.5 px tall), well before it could outgrow the ring.</summary>
+        public static bool ProjectMarker(Vector3d cam, Quaternion rot, double tanV, Vector3d vesselPos, double vesselSize,
+                                         CelestialBody body, double barFraction, out Vector2 screen, out float fade)
+        {
             screen = Vector2.zero;
+            fade = 0f;
             float W = Screen.width, H = Screen.height;
             Vector3d vrel = vesselPos - cam;
             double vd = vrel.magnitude;
@@ -261,6 +270,8 @@ namespace Seamless
             if (vq.z <= 0.01f) return false;
             double px = vesselSize / Math.Max(1.0, vd * vq.z) / (2.0 * tanV) * H;
             if (px >= 10.0 || Occluded(cam, vrel, vd, body.position, body.Radius)) return false;
+            double x = Math.Max(0.0, Math.Min(1.0, (px - 1.0) / 1.5));
+            fade = (float)(1.0 - x * x * (3.0 - 2.0 * x));
             double ndcX = vq.x / (vq.z * tanV * Aspect), ndcY = vq.y / (vq.z * tanV);
             double inner = 1.0 - 2.0 * barFraction - 0.04;
             screen = new Vector2((float)((ndcX + 1) * 0.5 * W), (float)((ndcY + 1) * 0.5 * H));

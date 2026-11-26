@@ -32,6 +32,10 @@ namespace Seamless
         private static int idleFrames;
         private static bool finishing;
 
+        /// <summary>The last finished preload (<see cref="LoadTimes"/>): seconds from its start until
+        /// the scene was read, and how much of that came after the switch; -1 = not measured.</summary>
+        internal static float LastRead = -1f, LastReadAfterSwitch = -1f;
+
         /// <summary>A preloaded scene is waiting for activation (the async-load queue is stalled).</summary>
         internal static bool Held => op != null;
 
@@ -64,6 +68,7 @@ namespace Seamless
                 index = (int)scene;
                 startedAt = Time.realtimeSinceStartup;
                 readyAt = -1f;
+                LastRead = LastReadAfterSwitch = -1f;
                 idleFrames = 0;
                 finishing = false;
                 HarmonyHook.TextureLoaderDeferrals = 0;
@@ -147,7 +152,16 @@ namespace Seamless
             yield return null;
             GC.Collect();
             o.allowSceneActivation = true;
-            while (!o.isDone) yield return null;
+            while (!o.isDone)
+            {
+                if (readyAt < 0f && o.progress >= 0.9f) readyAt = Time.realtimeSinceStartup;
+                yield return null;
+            }
+            if (readyAt >= 0f)
+            {
+                LastRead = readyAt - startedAt;
+                LastReadAfterSwitch = Math.Max(0f, readyAt - t0);
+            }
             op = null;
             index = -1;
             oldScenes = null;

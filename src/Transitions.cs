@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using KSP.UI;
@@ -83,6 +84,38 @@ namespace Seamless
         private bool retakeRequested;
         private int retakes;
 
+        // Dynamic timing (preloaded transitions only, setting dynamicTiming): the camera move is
+        // lengthened to cover the recorded load time and the card left out when the load should be
+        // over at once. Each such load is measured from the switch to the card's dissolve.
+        private bool preloaded, cardSkipped, holdCut;
+
+        // In-place vessel switch (setting inSceneSwitch): the target craft (in space) is loaded when
+        // the camera flight comes to rest on its shot, and KSP switches to it as to a loaded craft -
+        // no save, no scene reload, no card; the arrival zoom follows straight on.
+        private bool inSceneSwitch;
+
+        // Direct flight (in-place switches): one camera move from the departing craft to the
+        // target craft's own camera view, homing on the craft itself (centred once the opening turn
+        // is done) - no planet shot on the way. Far out the camera swings to above the craft's
+        // horizon (directDirDist), so its planet never stands between. The craft is loaded and
+        // switched to as the camera passes directSwitchDist (still far: the floating origin moves
+        // to it unseen); the rest of the same move is flown as its arrival, on the same clock.
+        private bool directFlight, directArrive;
+        private CamPose directEnd;          // end pose relative to the target (planning; the flown end is rig.Home())
+        private double directSwitchDist, directDirDist, directSwitchU = 1.0, directU0;
+        private double lastU;
+        private bool departApplied;         // the departure has put the camera somewhere (lastCam is valid)
+
+        // The opening turn (from the current view to the path's own view) runs on its own clock,
+        // departTurnSeconds, instead of along the path: on a long trip the path's first half takes
+        // many seconds, and the camera seemed not to move.
+        private double turnW = 1.0;
+        private Quaternion turnFix = Quaternion.identity;
+        private Vessel inSceneTarget;
+        private static bool stockSwitch;   // the next unloaded-target switch is KSP's own (fallback)
+        private float cardEndAt;
+        private string LoadKey => kind + " " + targetScene;
+
         // KSP's loading screen: drawn invisible while ours covers the scene (its own timing, which
         // also brings the UI back, keeps running), restored as soon as KSP itself hides it.
         private static Camera maskCam;
@@ -144,16 +177,47 @@ namespace Seamless
 
         // the time of the last log line not from us: a scene still loading clouds, terrain and
         // textures logs as it goes (EVE, Parallax, Kopernicus, PQS); quiet = settled
-        // (a mod logging every frame must not hold it forever: "quiet" = fewer than 6 lines in the window)
+        // (a mod logging every frame must not hold it forever: "quiet" = fewer than 6 lines in the window,
+        // and a line seen more than RepeatLimit times since the arrival began is a repeating error or
+        // status line, not loading, so it is not counted)
         private static readonly float[] foreignLogs = new float[6];
         private static int foreignLogNext;
+        private static readonly Dictionary<string, int> logRepeats = new Dictionary<string, int>();
+        private static int logRepeatsIgnored;
+        private const int RepeatLimit = 3;
 
         private static void OnLog(string message, string stack, LogType type)
         {
             if (message != null && (message.StartsWith("[Seamless]", StringComparison.Ordinal)
                                     || message.StartsWith("[UIMasterController]", StringComparison.Ordinal))) return;
+            if (Repeating(message)) { logRepeatsIgnored++; return; }
             foreignLogs[foreignLogNext] = Time.realtimeSinceStartup;
             foreignLogNext = (foreignLogNext + 1) % foreignLogs.Length;
+        }
+
+        /// <summary>The line (its first line, digits ignored) was already seen RepeatLimit times since
+        /// <see cref="ResetLogRepeats"/>.</summary>
+        private static bool Repeating(string message)
+        {
+            if (string.IsNullOrEmpty(message)) return false;
+            var sb = new System.Text.StringBuilder(Math.Min(message.Length, 160));
+            for (int i = 0; i < message.Length && sb.Length < 160; i++)
+            {
+                char c = message[i];
+                if (c == '\n' || c == '\r') break;
+                if (!char.IsDigit(c)) sb.Append(c);
+            }
+            string key = sb.ToString();
+            if (logRepeats.Count > 4000) logRepeats.Clear();
+            logRepeats.TryGetValue(key, out int n);
+            logRepeats[key] = n + 1;
+            return n >= RepeatLimit;
+        }
+
+        private static void ResetLogRepeats()
+        {
+            logRepeats.Clear();
+            logRepeatsIgnored = 0;
         }
 
         private bool Settled()
@@ -980,6 +1044,13 @@ namespace Seamless
             waitUnpack = unpackLogged = false;
             retStart = -1;
             riseRequired = false;
+            preloaded = cardSkipped = holdCut = false;
+            cardEndAt = -1f;
+            directFlight = directArrive = false;
+            directSwitchU = 1.0;
+            departApplied = false;
+            turnW = 1.0;
+            turnFix = Quaternion.identity;
             Director.AbortActive("scene transition");
 
             drv = driver;
@@ -1013,7 +1084,82 @@ namespace Seamless
             frozenZoom = 1f;
             frozenPlanetOnScreen = false;
             phase = Phase.Depart;
-            if (S.preloadScene) ScenePreload.Start(scene);
+            preloaded = S.preloadScene && !inSceneSwitch && ScenePreload.Start(scene);
+            if (preloaded && S.dynamicTiming)
+            {
+                try { PlanLoadTiming(); }
+                catch (Exception e) { Log.Warn("dynamic timing: " + e.Message); }
+            }
+        }
+
+        /// <summary>
+        /// The card shows for whatever of the background read is left when the camera move ends,
+        /// plus everything after the switch (the old scene is gone then: no camera move can hide
+        /// that part). So the move is lengthened only while the read is still running, to leave
+        /// about cardTargetSeconds of card, and never past dynamicMaxSeconds; the card is left out
+        /// when the load is expected to be over within cardSkipSeconds of the switch.
+        /// </summary>
+        private void PlanLoadTiming()
+        {
+            if (!LoadTimes.Expected(LoadKey, out float read, out float after))
+            {
+                Log.Info("dynamic timing: no load times recorded for " + LoadKey + " yet");
+                return;
+            }
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            double T0 = Math.Max(0.1, turnSeconds + travelSeconds);
+            double want = read + after - S.cardTargetSeconds;
+            double T = Math.Max(T0, Math.Min(want, Math.Min(read, Math.Max(T0, S.dynamicMaxSeconds))));
+            string how;
+            if (T > T0 + 0.05)
+            {
+                double k = T / T0;
+                turnSeconds *= k;
+                travelSeconds *= k;
+                flightT = T;
+                how = string.Format(inv, "{0} lengthened {1:F1} -> {2:F1} s", staticDepart ? "hold" : "flight", T0, T);
+            }
+            else how = string.Format(inv, "{0} kept at {1:F1} s", staticDepart ? "hold" : "flight", T0);
+            double card = Math.Max(0.0, read - T) + after;
+            // A load that ends on a craft keeps its card: the planet shot with the craft's name and
+            // details is the arrival's opening shot, not a wait.
+            cardSkipped = S.cardSkipSeconds > 0f && card <= S.cardSkipSeconds && !staticDepart && kind != Kind.SaveLoad
+                          && targetScene != GameScenes.FLIGHT;
+            if (cardSkipped) overlay.TextScale = 0f;
+            Log.Info(string.Format(inv, "dynamic timing ({0}; recorded {1}): {2}, card expected {3:F1} s{4}",
+                LoadKey, LoadTimes.Describe(LoadKey), how, card, cardSkipped ? " - left out" : ""));
+        }
+
+        /// <summary>Per frame after the switch: a left-out card comes back if the load runs long
+        /// after all; the end of the card (the frozen frame starting to dissolve) records the load.</summary>
+        private void WatchCard()
+        {
+            if (overlay == null || !loadIssued || cardEndAt >= 0f) return;
+            float now = Time.realtimeSinceStartup;
+            if (phase == Phase.Loading || overlay.LastFrozenAlpha >= 0.999f)
+            {
+                if (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)) holdCut = true;
+                if (cardSkipped && now - loadAt > S.cardSkipSeconds + 0.5f)
+                {
+                    if (overlay.TextScale <= 0f) Log.Info("dynamic timing: the load runs longer than expected - showing the card");
+                    overlay.TextScale = Mathf.Min(1f, overlay.TextScale + Time.unscaledDeltaTime / 0.8f);
+                }
+                return;
+            }
+            cardEndAt = now;
+            if (!preloaded) return;
+            float hold = cardEndAt - loadAt;
+            if (holdCut || ScenePreload.LastRead < 0f)
+            {
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "card up {0:F1} s after the switch (not recorded: {1})", hold, holdCut ? "cut short" : "read time unknown"));
+                return;
+            }
+            float after = Math.Max(0f, hold - ScenePreload.LastReadAfterSwitch);
+            LoadTimes.Record(LoadKey, ScenePreload.LastRead, after);
+            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "load recorded for {0}: read {1:F1} s ({2:F1} s of it after the switch), card up {3:F1} s after the switch",
+                LoadKey, ScenePreload.LastRead, ScenePreload.LastReadAfterSwitch, hold));
         }
 
         /// <summary>A scene load that skips the transition hook.</summary>
@@ -1066,6 +1212,133 @@ namespace Seamless
             BeginFromFlight(v, fc, scene, Kind.SpaceCenter);
         }
 
+        /// <summary>Harmony prefix body for FlightGlobals.setActiveVessel (an unloaded target): true =
+        /// Seamless switches in place (KSP's own switch, a save and a scene reload, is skipped).</summary>
+        internal static bool TakeOverSwitch(Vessel target, bool force)
+        {
+            if (stockSwitch) { stockSwitch = false; return false; }
+            if (instance == null || target == null || target.loaded) return false;
+            try { return instance.TryStartInScene(target, force); }
+            catch (Exception e) { Log.Warn("in-place switch not started: " + e); return false; }
+        }
+
+        private bool TryStartInScene(Vessel target, bool force)
+        {
+            if (phase != Phase.Idle || !HighLogic.LoadedSceneIsFlight) return false;
+            Vessel v = FlightGlobals.ActiveVessel;
+            FlightCamera fc = FlightCamera.fetch;
+            if (v == null || target == v || v.mainBody == null || target.mainBody == null || target.protoVessel == null
+                || fc == null || fc.GetPivot() == null || ScaledCamera.Instance == null) return false;
+            S = Settings.Load();
+            if (!S.enabled || !S.vesselSwitchTransition || !S.inSceneSwitch) return false;
+            string why = InSceneBlocker(target);
+            if (why != null)
+            {
+                Log.Info("switching to " + target.vesselName + " with a scene reload: " + why);
+                return false;
+            }
+            if (!force)
+            {
+                // KSP's own checks for a switch (it posts the message when they fail)
+                ClearToSaveStatus st = FlightGlobals.ClearToSave();
+                if (st != ClearToSaveStatus.CLEAR && st != ClearToSaveStatus.ORBIT_EVENT_IMMINENT) return false;
+                if (target.DiscoveryInfo != null && target.DiscoveryInfo.Level != DiscoveryLevels.Owned) return false;
+            }
+            inSceneSwitch = true;
+            inSceneTarget = target;
+            Log.Info("in-place switch to " + target.vesselName + " (no scene reload)");
+            BeginSwitch(v, fc, target);
+            return true;
+        }
+
+        /// <summary>Why a craft is switched to with KSP's scene reload, or null. Loaded far from the
+        /// active craft, a craft on or near the ground would sit on terrain that is not built yet.</summary>
+        private static string InSceneBlocker(Vessel t)
+        {
+            if (Shots.SurfaceLike(t)) return "it is on or near the ground";
+            if (t.vesselType == VesselType.SpaceObject) return "it is a space object";
+            CelestialBody b = t.mainBody;
+            if (b.atmosphere && t.altitude < b.atmosphereDepth) return "it is inside the atmosphere";
+            return null;
+        }
+
+        /// <summary>The end of an in-place switch's flight: the camera is at rest on the target's shot.
+        /// The target is loaded there (KSP would unload it again this far from the active craft, so
+        /// its unload range is lifted until it is the active one), KSP switches to it as to any
+        /// loaded craft, and the arrival zoom starts from the same shot.</summary>
+        private void SwitchInPlace()
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            Vessel target = inSceneTarget;
+            if (target == null || target.state == Vessel.State.DEAD || target.protoVessel == null)
+            {
+                FallBackToReload("the craft is gone");
+                return;
+            }
+            float t0 = Time.realtimeSinceStartup;
+            VesselRanges saved = target.vesselRanges;
+            try
+            {
+                var keep = new VesselRanges(saved);
+                foreach (VesselRanges.Situation s in new[] { keep.prelaunch, keep.landed, keep.splashed, keep.flying, keep.subOrbital, keep.orbit, keep.escaping })
+                    s.unload = float.MaxValue;
+                target.vesselRanges = keep;
+                if (!target.loaded) target.Load();
+            }
+            catch (Exception e) { Log.Warn("loading " + target.vesselName + ": " + e); }
+            if (!target.loaded)
+            {
+                target.vesselRanges = saved;
+                FallBackToReload("the craft did not load");
+                return;
+            }
+            float loaded = Time.realtimeSinceStartup - t0;
+
+            // the departure's camera rig lets go without handing the camera back to the old craft
+            try { drv.TakenAway = null; } catch { }
+            try { if (drv is CameraRig cr) cr.Release(); else drv.Leave(); } catch { }
+            Vessel old = FlightGlobals.ActiveVessel;
+            bool ok;
+            try { ok = FlightGlobals.ForceSetActiveVessel(target); }
+            catch (Exception e) { Log.Warn("in-place switch: " + e); ok = false; }
+            target.vesselRanges = saved;
+            if (!ok || FlightGlobals.ActiveVessel != target)
+            {
+                FallBackToReload("KSP did not switch to it");
+                return;
+            }
+            int parts = 0;
+            try { parts = target.parts.Count; } catch { }
+            double flightClock = t;
+            loadIssued = true;
+            loadAt = Time.realtimeSinceStartup;
+            measuring = true;
+            Unpause();
+            Log.Info(string.Format(inv, "switched in place from {0} to {1}: {2} parts loaded in {3:F2} s, switch done {4:F2} s after the flight ended",
+                old != null ? old.vesselName : "?", target.vesselName, parts, loaded, Time.realtimeSinceStartup - t0));
+            directArrive = directFlight && flightLam != null && flightClock < turnSeconds + travelSeconds;
+            directClock = flightClock;
+            BeginArrive(target);
+        }
+
+        /// <summary>The in-place switch could not be done: KSP's own switch (save, scene reload) runs.</summary>
+        private void FallBackToReload(string why)
+        {
+            Vessel target = inSceneTarget;
+            Log.Warn("in-place switch failed (" + why + ") - switching with a scene reload");
+            loadIssued = true;   // Fail must not load the scene itself
+            try { if (drv is CameraRig cr && FlightCamera.fetch != null) FlightCamera.fetch.ActivateUpdate(); } catch { }
+            Fail();
+            if (target == null || target.state == Vessel.State.DEAD) return;
+            stockSwitch = true;
+            bypass = true;
+            bool ok = false;
+            try { ok = FlightGlobals.ForceSetActiveVessel(target); }
+            catch (Exception e) { Log.Warn("switch: " + e.Message); }
+            finally { stockSwitch = false; }
+            if (!ok) bypass = false;
+        }
+
         private void BeginSwitch(Vessel v, FlightCamera fc, Vessel target)
         {
             PrepareTarget(target);
@@ -1100,6 +1373,14 @@ namespace Seamless
                         CamPose p = Shots.ReaimOnVessel(off, rot, ray, tan);
                         return new CamPose(target.GetWorldPos3D() + p.Off - anchor, p.Rot, p.TanV);
                     };
+                }
+                else if (inSceneSwitch)
+                {
+                    // direct flight: straight at the craft (directEnd is set by PlanFlight)
+                    carryValid = false;
+                    travelSubject = () => target.GetWorldPos3D();
+                    travelCenter = () => target.GetWorldPos3D();
+                    departTarget = anchor => new CamPose(target.GetWorldPos3D() + directEnd.Off - anchor, directEnd.Rot, directEnd.TanV);
                 }
                 else
                 {
@@ -1191,6 +1472,9 @@ namespace Seamless
             Quaternion rot = ShotSolver.AimAnyRay(subject - (anchor + off), new Vector3d(0, 0, 1), up);
             departMid = new CamPose(off, rot, tanV);
 
+            directFlight = inSceneSwitch && switchVessel != null && travelCenter != null;
+            if (directFlight) PlanDirect(anchor + (clear ? off : departStart.Off));
+
             CamPose end = departTarget(anchor);
             Vector3d P = TravelCenter();
             double dm = Math.Max(1.0, (anchor + off - P).magnitude);
@@ -1202,6 +1486,11 @@ namespace Seamless
                 turnSeconds += Math.Min(2.0, 0.2 * Math.Log(Math.Max(1.0, off.magnitude / Math.Max(1.0, departStart.Off.magnitude))));
             travelSeconds = Math.Min(S.departMaxSeconds, S.departSeconds + 0.35 * decades);
             RetimeFlight(anchor);
+            turnW = 1.0;
+            DepartPoseAt(0.0, anchor, out _, out Quaternion r0, out _, out _);
+            turnFix = Quaternion.Inverse(r0) * departStart.Rot;
+            if (directFlight) FindDirectSwitch(anchor);
+            turnW = 0.0;
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                 "flight: {0}{1:F0} km to {2:F0} km from {3}'s centre, {4:F1} s",
                 clear ? (low ? "rise first (low), " : "rise first (destination behind the planet), ") : "",
@@ -1297,12 +1586,14 @@ namespace Seamless
                 if (dt > 0.1f) { stallFrames++; if (dt > maxStall) maxStall = dt; smooth = 0; }
                 else smooth++;
             }
-            try { Step(); }
+            try { Step(); WatchCard(); }
             catch (Exception e)
             {
                 Log.Warn("transition failed, loading normally: " + e);
                 Fail();
             }
+            // orbit renderers added after the hiding (the craft made active by an in-place switch)
+            try { if (sceneOrbits != null) sceneOrbits.Keep(); } catch { }
         }
 
         private void LateUpdate()
@@ -1320,6 +1611,8 @@ namespace Seamless
                     t += Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0);
                     WatchMusic();
                     HoldVessels();
+                    if (inSceneSwitch && (!departAlive() || t >= turnSeconds + travelSeconds || (directFlight && departApplied && FlightU(t) >= directSwitchU)))
+                    { SwitchInPlace(); break; }
                     if (!departAlive()) { Freeze(false); break; }
                     ApplyCurrent(true);
                     if (t >= turnSeconds + travelSeconds)
@@ -1378,7 +1671,14 @@ namespace Seamless
                 return;
             }
             Vector3d anchor = departAnchor();
-            DepartPoseAt(FlightU(t), anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight);
+            // the turn starts at once and settles (ease-out): an ease-in read as "not moving yet"
+            double tw = Math.Min(1.0, t / Math.Max(0.05, S.departTurnSeconds));
+            turnW = 1.0 - (1.0 - tw) * (1.0 - tw) * (1.0 - tw);
+            double u = FlightU(t);
+            if (directFlight) u = Math.Min(u, directSwitchU);   // the rest is flown as the arrival
+            lastU = u;
+            departApplied = true;
+            DepartPoseAt(u, anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight);
             cam = TerrainClamp(cam);
             drv.Apply(cam, rot, tanV, weight);
             if (HighLogic.LoadedScene == GameScenes.SPACECENTER && drv is CameraRig)
@@ -1392,6 +1692,24 @@ namespace Seamless
         /// then the zoom, or one continuous pan when no rise is needed.</summary>
         private void DepartPoseAt(double u, Vector3d anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight)
         {
+            PathPoseAt(u, anchor, out cam, out rot, out tanV, out weight);
+            if (directFlight)
+            {
+                // never through the craft's planet: above half the craft's altitude (or the
+                // start's height, when the flight starts lower on that planet)
+                Vector3d bp = travelBody.position;
+                double R = travelBody.Radius;
+                double rv = (travelSubject() - bp).magnitude;
+                double rMin = R + 0.5 * Math.Max(0.0, rv - R);
+                double rs = (anchor + departStart.Off - bp).magnitude;
+                cam = OutsideSphere(cam, bp, Math.Min(rMin, Math.Max(R * 1.001, rs)));
+            }
+            // what is left of the opening turn (the current view against the path's first view)
+            if (turnW < 1.0) rot = rot * Quaternion.Slerp(turnFix, Quaternion.identity, (float)turnW);
+        }
+
+        private void PathPoseAt(double u, Vector3d anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight)
+        {
             Vector3d Pd = departBody.position;
             if (!riseRequired)
             {
@@ -1402,23 +1720,20 @@ namespace Seamless
                 Vector3d um = anchor + departStart.Off - P, ue = endCam - P;
                 double dm = Math.Max(1.0, um.magnitude), de = Math.Max(1.0, ue.magnitude);
                 double dist = Math.Exp(Math.Log(dm) + (Math.Log(de) - Math.Log(dm)) * u);
-                Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)u).normalized;
+                double wd = directFlight ? DirectDirWeight(dist, dm, de) : u;
+                Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)wd).normalized;
                 cam = P + (Vector3d)dir * dist;
 
-                // destination locked on screen: from its spot in the current view to its final spot
+                // destination locked on screen: centred at first (the opening turn, on its own clock,
+                // brings it there from wherever it is in the current view), then to its final spot
                 Vector3d subject = travelSubject();
                 Vector3 endRay = (Quaternion.Inverse(end.Rot) * (Vector3)(subject - endCam).normalized).normalized;
-                Vector3d startCam = anchor + departStart.Off;
-                Vector3 startRay = (Quaternion.Inverse(departStart.Rot) * (Vector3)(subject - startCam).normalized).normalized;
-                if (startRay.z < 0.2f) startRay = Vector3.forward;   // out of view: turned to below
+                Vector3 startRay = Vector3.forward;
                 Vector3 ray = Vector3.Lerp(startRay, endRay, (float)u).normalized;
                 Vector3 up = Vector3.Slerp(departStart.Rot * Vector3.up, end.Rot * Vector3.up, (float)u);
                 rot = ShotSolver.AimAnyRay(subject - cam, (Vector3d)ray, (Vector3d)up);
-                // the very first frame is the current view: what aiming leaves over (a roll, or the
-                // whole turn when the destination was out of view) eases out over the first half
-                Quaternion rot0 = ShotSolver.AimAnyRay(subject - startCam, (Vector3d)startRay, (Vector3d)(departStart.Rot * Vector3.up));
-                Quaternion fix = Quaternion.Inverse(rot0) * departStart.Rot;
-                rot = rot * Quaternion.Slerp(fix, Quaternion.identity, Overlay.Ease((float)Math.Min(1.0, u / 0.5)));
+                // what aiming leaves over at the start (a roll, or the whole turn when the
+                // destination was out of view) is taken out by DepartPoseAt over departTurnSeconds
                 if (u > 0.85) rot = Quaternion.Slerp(rot, end.Rot, Overlay.Ease((float)((u - 0.85) / 0.15)));
                 tanV = Math.Exp(Math.Log(departStart.TanV) + (Math.Log(end.TanV) - Math.Log(departStart.TanV)) * u);
                 weight = 0.3 + 0.7 * u;
@@ -1433,7 +1748,9 @@ namespace Seamless
                 double uMid = flightUMid;
                 double s = uMid > 0.0 ? Math.Min(1.0, u / uMid) : 1.0;
                 CamPose p = CamPose.Blend(departStart, departMid, s);
-                cam = anchor + p.Off; rot = p.Rot; tanV = p.TanV; weight = 0.3 * s;
+                cam = anchor + p.Off; tanV = p.TanV; weight = 0.3 * s;
+                Vector3 upR = Vector3.Slerp(departStart.Rot * Vector3.up, departMid.Rot * Vector3.up, (float)s);
+                rot = ShotSolver.AimAnyRay(travelSubject() - cam, new Vector3d(0, 0, 1), (Vector3d)upR);
                 // never lower than where the camera started (or the clear height, if it started above it)
                 double floor = Math.Min(safeRadius, Math.Min((anchor + departStart.Off - Pd).magnitude, (anchor + departMid.Off - Pd).magnitude));
                 cam = OutsideSphere(cam, Pd, floor);
@@ -1448,7 +1765,8 @@ namespace Seamless
                 Vector3d um = anchor + departMid.Off - P, ue = endCam - P;
                 double dm = Math.Max(1.0, um.magnitude), de = Math.Max(1.0, ue.magnitude);
                 double dist = Math.Exp(Math.Log(dm) + (Math.Log(de) - Math.Log(dm)) * s);
-                Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)s).normalized;
+                double wd = directFlight ? DirectDirWeight(dist, dm, de) : s;
+                Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)wd).normalized;
                 cam = P + (Vector3d)dir * dist;
 
                 // destination locked on screen: from the centre of the view to its final spot
@@ -1555,13 +1873,16 @@ namespace Seamless
                 flightLen = L; flightPeak = V; flightRamp = Ta; flightProfileT = Tp;
                 // never quicker than before, never longer than departMaxSeconds (a capped trip runs
                 // the same profile a little faster)
-                double T = Math.Min(Math.Max(total0, Tp), Math.Max(total0, S.departMaxSeconds));
+                // a direct flight also covers the zoom in that otherwise follows it
+                double cap = S.departMaxSeconds + (directFlight ? S.zoomInSeconds : 0f);
+                double T = Math.Min(Math.Max(total0, Tp), Math.Max(total0, cap));
                 flightT = T;
                 travelSeconds = Math.Max(0.1, T - turnSeconds);
                 if (turnSeconds > T - 0.1) { turnSeconds = 0.5 * T; travelSeconds = T - turnSeconds; }
                 Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "flight timing: {0:F1} e-folds of view change, {1:F1} s (was {2:F1} s; peak {3:F2}/s, ramps {4:F1} s{5})",
-                    L, T, total0, V * Tp / T, Ta * T / Tp, Tp > T + 0.05 ? ", sped up to fit departMaxSeconds" : ""));
+                    L, T, total0, V * Tp / T, Ta * T / Tp, Tp > T + 0.05 ? ", sped up to fit departMaxSeconds" : "")
+                    + (directFlight ? ", direct to the craft" : ""));
             }
             catch (Exception e) { flightLam = null; Log.Warn("flight timing: " + e.Message); }
         }
@@ -1579,12 +1900,22 @@ namespace Seamless
                 DetailAlpha = Mathf.Clamp01((float)((sT - 0.65) / 0.2)),
                 Line = Mathf.Clamp01((float)((sT - 0.5) / 0.3)),
             };
+            if (directFlight)
+            {
+                // flying straight to the craft: its name, details and marker from the start
+                f.TitleAlpha = Mathf.Clamp01((float)((t - 0.4) / 0.6));
+                f.DetailAlpha = Mathf.Clamp01((float)((t - 0.7) / 0.6));
+                f.Line = Mathf.Clamp01((float)((t - 0.3) / 0.6));
+            }
             f.MarkerAlpha = f.TitleAlpha;
             if (framedBody != null)
                 f.PlanetOnScreen = CameraRig.ProjectSphere(cam, rot, tanV, framedBody.position, framedBody.Radius, out f.Planet, out f.PlanetRadius);
             if (switchVessel != null && S.showVesselMarker)
+            {
                 f.MarkerOnScreen = CameraRig.ProjectMarker(cam, rot, tanV, switchVessel.GetWorldPos3D(), switchVesselSize,
-                                                           switchVessel.mainBody, S.barFraction, out f.Marker);
+                                                           switchVessel.mainBody, S.barFraction, out f.Marker, out float fade);
+                f.MarkerAlpha *= fade;
+            }
             return f;
         }
 
@@ -1777,7 +2108,13 @@ namespace Seamless
             Vector3d anchor = rig.Anchor(v);
             double sx = 2.0 * S.planetScreenX - 1.0;
 
-            if (kind == Kind.Launch && DoorPose(v, anchor, out Vector3d dOff, out Quaternion dRot, out Vector3 dRay, out double dTan))
+            if (directArrive)
+            {
+                // the rest of the departure's move: from where its last frame left the camera
+                var from = new CamPose(lastCam - anchor, lastRot, lastTanV);
+                estPose = a => from;
+            }
+            else if (kind == Kind.Launch && DoorPose(v, anchor, out Vector3d dOff, out Quaternion dRot, out Vector3 dRay, out double dTan))
             {
                 estPose = a => Shots.ReaimOnVessel(dOff, dRot, dRay, dTan);
             }
@@ -1832,7 +2169,115 @@ namespace Seamless
             liveAt = waitUnpack ? -1 : 0;
             unpackLogged = !v.packed;
             phase = Phase.Arrive;
+            if (directArrive) StartDirectReturn(v, anchor);
             ArriveApply(true);
+        }
+
+        private double directClock;
+
+        /// <summary>The arrival of a direct flight: the zoom from the planet shot to the craft's own
+        /// camera view, on the departure's clock (same profile, no stop). The flight camera is set
+        /// to end where the planning aimed: the fitting distance, looking along the way in.</summary>
+        private void StartDirectReturn(Vessel v, Vector3d anchor)
+        {
+            t = directClock;
+            liveAt = 0;
+            waitUnpack = false;
+            retFrom = estPose(anchor);
+            directU0 = Math.Min(0.999, lastU);
+            try
+            {
+                FlightCamera fc = rig.Fc;
+                double size = Shots.VesselSize(v);
+                arriveSize = size;
+                fc.SetDistanceImmediate((float)FitDistance(fc, size, rig.OrigFov));
+            }
+            catch (Exception e) { Log.Warn("camera distance not set: " + e.Message); }
+            if (S.keepShotAngle) AimHomeAlongShot(anchor, retFrom);
+            CelestialBody b = v.mainBody;
+            arrivePlan = Paths.Make(retFrom, rig.Home(), anchor, b.position, b.Radius);
+            retStart = t;
+            retDur = Math.Max(0.1, turnSeconds + travelSeconds - t);
+            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "zooming straight in: {0:F1} s to the craft's view ({1:F0} m){2}", retDur, rig.Fc.Distance,
+                arrivePlan != null ? ", around " + b.bodyName : ""));
+        }
+
+        /// <summary>The distance FlightCamera backs off to on a vessel switch (AdjustDistanceToFit).</summary>
+        private static double FitDistance(FlightCamera fc, double size, float fov)
+        {
+            double fit = size * 0.5 / Math.Tan(fov * 0.5 * Math.PI / 180.0) * fc.vesselSwitchBackoffFOVFactor + fc.vesselSwitchBackoffPadding;
+            return Math.Max(fc.minDistance, Math.Min(fc.maxDistance, Math.Max(fit, fc.startDistance)));
+        }
+
+        /// <summary>The direct flight's end, relative to the target: KSP's vessel-switch distance,
+        /// looking at the craft from the way the camera comes in, lifted to at least 15 degrees
+        /// above the craft's horizon (its planet below it in the view, never in the way).</summary>
+        private void PlanDirect(Vector3d startCam)
+        {
+            Vector3d tp = switchVessel.GetWorldPos3D();
+            Vector3d bp = travelBody.position;
+            Vector3d upT = (tp - bp).normalized;
+            Vector3d dirS = startCam - tp;
+            dirS = dirS.sqrMagnitude > 1.0 ? dirS.normalized : upT;
+            Vector3d dirE = AboveHorizon(dirS, upT, 15.0);
+            FlightCamera fc = FlightCamera.fetch;
+            float fov = drv is CameraRig cr ? cr.OrigFov : fc.FieldOfView;
+            double d = FitDistance(fc, switchVesselSize, fov);
+            directEnd = new CamPose(dirE * d, ShotSolver.AimAnyRay(-dirE, new Vector3d(0, 0, 1), upT),
+                                    Math.Tan(fov * 0.5 * Math.PI / 180.0));
+            double rt = (tp - bp).magnitude;
+            directSwitchDist = Math.Max(100000.0, 2.5 * rt);   // switch while this far out
+            directDirDist = 2.0 * directSwitchDist;            // the swing above the horizon done by here
+        }
+
+        private static Vector3d AboveHorizon(Vector3d d, Vector3d up, double minDeg)
+        {
+            double a = minDeg * Math.PI / 180.0;
+            double k = Vector3d.Dot(d, up);
+            if (k >= Math.Sin(a)) return d;
+            Vector3d h = d - up * k;
+            h = h.sqrMagnitude > 1e-12 ? h.normalized : (Vector3d)ShotSolver.Perp(up).normalized;
+            return (h * Math.Cos(a) + up * Math.Sin(a)).normalized;
+        }
+
+        /// <summary>How far the direct flight's direction around the craft has turned at a distance:
+        /// done by directDirDist (well before the craft's planet could be in the way); a flight that
+        /// starts closer than that turns along its whole zoom.</summary>
+        private double DirectDirWeight(double dist, double dm, double de)
+        {
+            double l = Math.Log(Math.Max(1.0, dist)), lm = Math.Log(Math.Max(1.0, dm)), le = Math.Log(Math.Max(1.0, de));
+            double lw = Math.Log(Math.Max(1.0, directDirDist));
+            double x = dm > 1.5 * directDirDist ? (lm - l) / Math.Max(1e-6, lm - lw) : (lm - l) / Math.Max(1e-6, lm - le);
+            x = Math.Max(0.0, Math.Min(1.0, x));
+            return x * x * (3.0 - 2.0 * x);
+        }
+
+        /// <summary>Where on the path (u) the craft is loaded and switched to: the first point within
+        /// directSwitchDist of it (0 = at once, when the flight starts that close).</summary>
+        private void FindDirectSwitch(Vector3d anchor)
+        {
+            directSwitchU = 1.0;
+            Vector3d tp = switchVessel.GetWorldPos3D();
+            const int n = 400;
+            for (int i = 0; i <= n; i++)
+            {
+                double u = (double)i / n;
+                DepartPoseAt(u, anchor, out Vector3d cam, out _, out _, out _);
+                if ((cam - tp).magnitude <= directSwitchDist) { directSwitchU = u; break; }
+            }
+            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                "direct to the craft: switch {0:F0} km out at {1:F1} s of {2:F1} s, ending {3:F0} m away",
+                directSwitchDist / 1000.0, TimeAtU(directSwitchU), turnSeconds + travelSeconds, directEnd.Off.magnitude));
+        }
+
+        /// <summary>Flight time at path position u (the inverse of FlightU).</summary>
+        private double TimeAtU(double u)
+        {
+            double T = turnSeconds + travelSeconds;
+            double lo = 0.0, hi = T;
+            for (int i = 0; i < 40; i++) { double m = 0.5 * (lo + hi); if (FlightU(m) < u) lo = m; else hi = m; }
+            return hi;
         }
 
         /// <summary>The PhysicsHold mod is installed and its hold is on for this craft: it stays
@@ -1943,6 +2388,16 @@ namespace Seamless
 
         private CamPose ArrivePose(Vector3d anchor)
         {
+            if (directArrive && retStart >= 0)
+            {
+                double u = FlightU(t);
+                double sd = Math.Max(0.0, Math.Min(1.0, (u - directU0) / (1.0 - directU0)));
+                skyWeight = 1.0 - sd;
+                CelestialBody db = arriveVessel.mainBody;
+                if (arrivePlan != null)
+                    return Paths.Around(retFrom, rig.Home(), anchor, db.position, db.Radius, sd, arrivePlan, ZoomTo);
+                return ZoomTo(retFrom, rig.Home(), sd);
+            }
             if (retStart < 0)
             {
                 skyWeight = 1.0;
@@ -2007,8 +2462,20 @@ namespace Seamless
                 DetailAlpha = Mathf.Clamp01(Mathf.Min(1f, textOut)),
                 MarkerAlpha = Mathf.Clamp01(textOut),
             };
+            if (directArrive && retStart >= 0)
+            {
+                // the details stay up all the way in and fade as the camera is handed back
+                double end = retStart + retDur;
+                float k = Mathf.Clamp01((float)((end - 0.2 - t) / 0.8));
+                f.Bars = Mathf.Clamp01((float)((end - t) / 1.2));
+                f.TitleAlpha = f.DetailAlpha = f.MarkerAlpha = f.Line = k;
+                f.FrozenAlpha = 0f;
+            }
             if (S.showVesselMarker)
-                f.MarkerOnScreen = CameraRig.ProjectMarker(cam, p.Rot, p.TanV, v.CoMD, arriveSize, v.mainBody, S.barFraction, out f.Marker);
+            {
+                f.MarkerOnScreen = CameraRig.ProjectMarker(cam, p.Rot, p.TanV, v.CoMD, arriveSize, v.mainBody, S.barFraction, out f.Marker, out float fade);
+                f.MarkerAlpha *= fade;
+            }
             overlay.Apply(f);
         }
 
@@ -2061,6 +2528,7 @@ namespace Seamless
             kscPlan = null;
             kscSettledAt = -1;
             kscFromBuilding = false;
+            ResetLogRepeats();
             if (kind == Kind.EditorExit)
             {
                 try
@@ -2202,7 +2670,8 @@ namespace Seamless
                 && (Settled() || t > kscWarmDoneAt + S.settleMaxSeconds || !S.liveLoading))
             {
                 kscSettledAt = t;
-                Milestone(t > kscWarmDoneAt + S.settleMaxSeconds ? "scene still busy, going on" : "scene settled");
+                Milestone((t > kscWarmDoneAt + S.settleMaxSeconds ? "scene still busy, going on" : "scene settled")
+                          + (logRepeatsIgnored > 0 ? " (" + logRepeatsIgnored + " repeated log lines not counted)" : ""));
             }
             if (retStart < 0 && t > 0.5 && (Input.GetKeyDown(S.skipKey) || Input.GetKeyDown(KeyCode.Escape) || Input.GetMouseButtonDown(0)))
             { if (kscWarmDoneAt < 0) kscWarmDoneAt = t; if (kscSettledAt < 0) kscSettledAt = t; retStart = t; retDur = Math.Min(S.zoomInSeconds, 2.0); PlanKsc(); }
@@ -2335,9 +2804,27 @@ namespace Seamless
             }
         }
 
+        /// <summary>
+        /// KSP's own terrain switch (PQSMod_CelestialBodyTransform.OnPreUpdate, every frame) must
+        /// leave this terrain alone: Seamless has it off in the Space Center scene. With no active
+        /// vessel KSP measures the altitude from no target and switched it straight back on, so the
+        /// two fought every frame; each switch-on starts the planet's on-demand texture loads again
+        /// (Kopernicus), which with JNSQ on Retooled logs a failed texture load every frame and held
+        /// the arrival until its 30 s limit (HarmonyHook skips that update while this is true).
+        /// </summary>
+        internal static bool HoldsTerrainOff(PQS pqs)
+        {
+            Transitions t = instance;
+            if (t == null || pqs == null || !ReferenceEquals(pqs, t.kscPqs) || pqs.isActive
+                || HighLogic.LoadedScene != GameScenes.SPACECENTER) return false;
+            t.kscPqsHeld++;
+            return true;
+        }
+
         private PQS kscPqs;
         private double kscPqsOffAbove;
         private bool kscPqsLogged;
+        private int kscPqsHeld;                 // KSP's terrain updates skipped while it was off
 
         /// <summary>
         /// In flight the planet's terrain system switches off above its deactivation altitude (by the
@@ -2363,6 +2850,7 @@ namespace Seamless
                         if (m != null && m.deactivateAltitude > 0.0) { kscPqsOffAbove = m.deactivateAltitude; break; }
                     if (kscPqsOffAbove <= 0.0) kscPqsOffAbove = Math.Max(90000.0, 0.25 * home.Radius);
                     kscPqsLogged = false;
+                    kscPqsHeld = 0;
                 }
                 double alt = (cam - home.position).magnitude - home.Radius;
                 if (kscPqs.isActive && alt > kscPqsOffAbove * 1.05)
@@ -2386,6 +2874,9 @@ namespace Seamless
         private void KscTerrainOn()
         {
             try { if (kscPqs != null && !kscPqs.isActive) kscPqs.ActivateSphere(); } catch { }
+            if (kscPqs != null && kscPqsHeld > 0)
+                Log.Info("terrain back on (KSP's own terrain update was held off for " + kscPqsHeld + " frames while it was off)");
+            kscPqsHeld = 0;
             kscPqs = null;
         }
 
@@ -2622,6 +3113,9 @@ namespace Seamless
             noRise = false;
             riseRequired = false;
             staticDepart = false;
+            inSceneSwitch = false;
+            inSceneTarget = null;
+            directFlight = directArrive = false;
             departVessel = null;
             arriveVessel = null;
             switchVessel = null;

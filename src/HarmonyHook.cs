@@ -81,6 +81,48 @@ namespace Seamless
                 }
             }
             catch (Exception e) { Log.Warn("EVE clouds patch not installed: " + e.Message); }
+
+            // KSP's own terrain switch would put the home planet's terrain straight back on while a
+            // Space Center far shot has it off (Transitions.HoldsTerrainOff)
+            try
+            {
+                var pre = AccessTools.Method(typeof(PQSMod_CelestialBodyTransform), nameof(PQSMod_CelestialBodyTransform.OnPreUpdate));
+                harmony.Patch(pre, prefix: new HarmonyMethod(typeof(HarmonyHook), nameof(BodyTransformPreUpdatePrefix)));
+            }
+            catch (Exception e) { Log.Warn("terrain hold not installed: " + e.Message); }
+
+            // Switching to a craft that is not loaded: KSP saves and reloads the whole flight scene.
+            // Where the craft is in space, Seamless loads it at the end of the camera flight and lets
+            // KSP switch to it in place instead (Transitions.TakeOverSwitch).
+            try
+            {
+                var sav = AccessTools.Method(typeof(FlightGlobals), "setActiveVessel", new[] { typeof(Vessel), typeof(bool), typeof(bool) });
+                if (sav != null)
+                {
+                    harmony.Patch(sav, prefix: new HarmonyMethod(typeof(HarmonyHook), nameof(SetActiveVesselPrefix)));
+                    InSceneSwitchReady = true;
+                }
+                else Log.Warn("in-place vessel switch unavailable: FlightGlobals.setActiveVessel not found");
+            }
+            catch (Exception e) { Log.Warn("in-place vessel switch not installed: " + e.Message); }
+        }
+
+        internal static bool InSceneSwitchReady;
+
+        private static bool SetActiveVesselPrefix(Vessel __0, bool __1, ref bool __result)
+        {
+            bool mine;
+            try { mine = Transitions.TakeOverSwitch(__0, __1); }
+            catch { mine = false; }
+            if (!mine) return true;
+            __result = true;
+            return false;
+        }
+
+        private static bool BodyTransformPreUpdatePrefix(PQSMod_CelestialBodyTransform __instance)
+        {
+            try { return !Transitions.HoldsTerrainOff(__instance.sphere); }
+            catch { return true; }
         }
 
         private static void CloudsUpdatePrefix(out GameScenes __state)

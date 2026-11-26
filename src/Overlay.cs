@@ -124,6 +124,13 @@ namespace Seamless
         /// <summary>The frozen frame is drawn under the game's UI cameras instead of over everything.</summary>
         public bool FrozenUnderUi => layer != null;
 
+        /// <summary>The card (text, leader line, marker) is drawn at this share of its alpha: 0 = no
+        /// card, where the load is expected to be over before it could be read.</summary>
+        public float TextScale = 1f;
+
+        /// <summary>The frozen frame's alpha as last applied.</summary>
+        public float LastFrozenAlpha { get; private set; }
+
         public void SetTexts(string titleText, string detailText)
         {
             title.text = titleText;
@@ -132,6 +139,12 @@ namespace Seamless
 
         public void Apply(OverlayFrame f)
         {
+            LastFrozenAlpha = f.FrozenAlpha;
+            float k = Mathf.Clamp01(TextScale);
+            f.TitleAlpha *= k;
+            f.DetailAlpha *= k;
+            f.MarkerAlpha *= k;
+            f.Line *= k;
             float W = Screen.width, H = Screen.height;
             if (sizedForHeight != Screen.height) Resize(H);
 

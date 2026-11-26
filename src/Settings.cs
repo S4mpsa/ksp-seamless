@@ -59,8 +59,13 @@ namespace Seamless
         public float warmUpSeconds = 2f;           // ... first the camera waits at the Space Center view under the card (terrain, clouds built); 0 = off
         public bool liveLoading = true;            // show the new scene while KSP still finishes loading it
         public bool preloadScene = true;           // read the new scene in the background during the departure
+        public bool inSceneSwitch = true;          // switching to a craft in space: load it and switch in place, no scene reload
+        public bool dynamicTiming = true;          // preloaded transitions: timing from recorded load times
+        public float cardTargetSeconds = 5f;       // ... flights lengthened (never sped up) so the card shows about this long
+        public float cardSkipSeconds = 1.5f;       // ... no card when the load is expected to be over this soon (0 = always a card)
+        public float dynamicMaxSeconds = 30f;      // ... flights are lengthened to at most this long
         public bool keepShotAngle = true;          // a switch's zoom ends looking at the craft from the opening shot's side
-        public float departTurnSeconds = 2f;  // turn towards the destination, craft in the foreground
+        public float departTurnSeconds = 1.5f; // the opening turn towards the destination, in seconds (any trip length)
         public float departSeconds = 3f;      // shortest flight to the destination
         public float departMaxSeconds = 12f;  // longest flight (interplanetary)
         public float flightMaxRate = 2f;      // flights: fastest view change, e-folds of distance (plus radians of turn) per second
@@ -142,6 +147,11 @@ namespace Seamless
                 Float(n, "warmUpSeconds", ref s.warmUpSeconds);
                 Bool(n, "liveLoading", ref s.liveLoading);
                 Bool(n, "preloadScene", ref s.preloadScene);
+                Bool(n, "inSceneSwitch", ref s.inSceneSwitch);
+                Bool(n, "dynamicTiming", ref s.dynamicTiming);
+                Float(n, "cardTargetSeconds", ref s.cardTargetSeconds);
+                Float(n, "cardSkipSeconds", ref s.cardSkipSeconds);
+                Float(n, "dynamicMaxSeconds", ref s.dynamicMaxSeconds);
                 Bool(n, "keepShotAngle", ref s.keepShotAngle);
                 Float(n, "departTurnSeconds", ref s.departTurnSeconds);
                 Float(n, "departSeconds", ref s.departSeconds);
@@ -194,6 +204,9 @@ namespace Seamless
             flightMaxRate = Mathf.Clamp(flightMaxRate, 0.2f, 20f);
             flightMaxAccel = Mathf.Clamp(flightMaxAccel, 0.1f, 20f);
             loadingMinSeconds = Mathf.Max(0f, loadingMinSeconds);
+            cardTargetSeconds = Mathf.Clamp(cardTargetSeconds, 0f, 60f);
+            cardSkipSeconds = Mathf.Clamp(cardSkipSeconds, 0f, 10f);
+            dynamicMaxSeconds = Mathf.Clamp(dynamicMaxSeconds, 0f, 120f);
             establishSeconds = Mathf.Max(0f, establishSeconds);
             zoomInSeconds = Mathf.Max(0.5f, zoomInSeconds);
         }

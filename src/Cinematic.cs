@@ -194,7 +194,10 @@ namespace Seamless
 
             f.PlanetOnScreen = CameraRig.ProjectSphere(cam, rot, tanV, body.position, body.Radius, out f.Planet, out f.PlanetRadius);
             if (S.showVesselMarker)
-                f.MarkerOnScreen = CameraRig.ProjectMarker(cam, rot, tanV, vessel.CoMD, vesselSize, body, S.barFraction, out f.Marker);
+            {
+                f.MarkerOnScreen = CameraRig.ProjectMarker(cam, rot, tanV, vessel.CoMD, vesselSize, body, S.barFraction, out f.Marker, out float fade);
+                f.MarkerAlpha *= fade;
+            }
             return f;
         }
 

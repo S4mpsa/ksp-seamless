@@ -29,6 +29,10 @@ namespace Seamless
 
         private readonly List<Entry> entries = new List<Entry>();
         private readonly List<PatchedConicRenderer> patches = new List<PatchedConicRenderer>();
+        // Renderers that have not run Start() yet (a craft made active this frame, the in-place
+        // switch): switched off now they would never build their patch list, and the craft's
+        // OrbitTargeter would throw on it every frame. They are switched off once started.
+        private readonly List<PatchedConicRenderer> pending = new List<PatchedConicRenderer>();
         private CommNet.CommNetUI commNet;
         private bool commNetEnabled, commNetLine, commNetHadLine, commNetShown;
         private static readonly System.Reflection.FieldInfo CommNetShownField =
@@ -59,6 +63,7 @@ namespace Seamless
                 foreach (PatchedConicRenderer pr in UnityEngine.Object.FindObjectsOfType<PatchedConicRenderer>())
                 {
                     if (pr == null || !pr.enabled) continue;
+                    if (pr.patchRenders == null) { o.pending.Add(pr); continue; }
                     pr.enabled = false;
                     ClearPatchLines(pr);
                     o.patches.Add(pr);
@@ -106,6 +111,14 @@ namespace Seamless
                 if (r.drawIcons != OrbitRendererBase.DrawIcons.NONE) r.drawIcons = OrbitRendererBase.DrawIcons.NONE;
                 r.drawNodes = false;
             }
+            for (int i = pending.Count - 1; i >= 0; i--)
+            {
+                PatchedConicRenderer pr = pending[i];
+                if (pr == null) { pending.RemoveAt(i); continue; }
+                if (pr.patchRenders == null) continue;
+                pending.RemoveAt(i);
+                patches.Add(pr);
+            }
             foreach (PatchedConicRenderer pr in patches)
                 if (pr != null && pr.enabled) { pr.enabled = false; ClearPatchLines(pr); }
             try
@@ -141,6 +154,7 @@ namespace Seamless
             foreach (PatchedConicRenderer pr in patches)
                 try { if (pr != null) pr.enabled = true; } catch { }
             patches.Clear();
+            pending.Clear();
             try
             {
                 if (commNet != null)
