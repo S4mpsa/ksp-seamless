@@ -45,7 +45,7 @@ namespace Seamless
         // Tracking Station (reveal); Launch: VAB / SPH -> launch site (arrive from the door);
         // ToKsc: Tracking Station -> Space Center and SaveLoad: main menu -> a save's Space Center
         // (both arrive from a Kerbin shot, zooming down into the Space Center view)
-        private enum Kind { SpaceCenter, VesselSwitch, Editor, KscToTracking, Launch, ToKsc, SaveLoad, EditorExit }
+        private enum Kind { SpaceCenter, VesselSwitch, Editor, KscToTracking, Launch, ToKsc, SaveLoad, EditorExit, FlightToEditor, EditorToTracking, TrackingToEditor, EditorSwitch, RevertToLaunch, ToMainMenu }
 
         private Settings S;
         private Phase phase = Phase.Idle;
@@ -290,6 +290,9 @@ namespace Seamless
             GameEvents.onLevelWasLoaded.Add(OnLevelWasLoaded);
             GameEvents.onGameSceneLoadRequested.Add(OnSceneLoadRequested);
             GameEvents.onGUIApplicationLauncherReady.Add(OnLauncherReady);
+            GameEvents.OnVesselRecoveryRequested.Add(OnRecoveryRequested);
+            GameEvents.OnRevertToPrelaunchFlightState.Add(OnRevertToPrelaunch);
+            GameEvents.OnRevertToLaunchFlightState.Add(OnRevertToLaunch);
             UnityEngine.SceneManagement.SceneManager.sceneLoaded += OnUnitySceneLoaded;
             Application.logMessageReceived += OnLog;
 
@@ -316,6 +319,9 @@ namespace Seamless
             GameEvents.onLevelWasLoaded.Remove(OnLevelWasLoaded);
             GameEvents.onGameSceneLoadRequested.Remove(OnSceneLoadRequested);
             GameEvents.onGUIApplicationLauncherReady.Remove(OnLauncherReady);
+            GameEvents.OnVesselRecoveryRequested.Remove(OnRecoveryRequested);
+            GameEvents.OnRevertToPrelaunchFlightState.Remove(OnRevertToPrelaunch);
+            GameEvents.OnRevertToLaunchFlightState.Remove(OnRevertToLaunch);
             UnityEngine.SceneManagement.SceneManager.sceneLoaded -= OnUnitySceneLoaded;
             Application.logMessageReceived -= OnLog;
         }
@@ -403,8 +409,18 @@ namespace Seamless
                     ? TryStartLaunchFromBase() : TryStartFromBase();
             if (HighLogic.LoadedScene == GameScenes.SPACECENTER && (scene == GameScenes.EDITOR || scene == GameScenes.TRACKSTATION))
                 return TryStartFromKsc(scene);
+            if (scene == GameScenes.MAINMENU && (HighLogic.LoadedScene == GameScenes.FLIGHT || HighLogic.LoadedScene == GameScenes.SPACECENTER
+                                                 || HighLogic.LoadedScene == GameScenes.TRACKSTATION || HighLogic.LoadedScene == GameScenes.EDITOR))
+                return TryStartQuit();
             if (HighLogic.LoadedScene == GameScenes.EDITOR && scene == GameScenes.FLIGHT)
-                return TryStartLaunch();
+                return FlightDriver.StartupBehaviour == FlightDriver.StartupBehaviours.NEW_FROM_FILE
+                    ? TryStartLaunch() : TryStartEditorToVessel();
+            if (HighLogic.LoadedScene == GameScenes.EDITOR && scene == GameScenes.TRACKSTATION)
+                return TryStartEditorStatic(GameScenes.TRACKSTATION, Kind.EditorToTracking);
+            if (HighLogic.LoadedScene == GameScenes.EDITOR && scene == GameScenes.EDITOR)
+                return TryStartEditorStatic(GameScenes.EDITOR, Kind.EditorSwitch);
+            if (HighLogic.LoadedScene == GameScenes.TRACKSTATION && scene == GameScenes.EDITOR)
+                return TryStartTrackingToKsc(GameScenes.EDITOR);
             if (HighLogic.LoadedScene == GameScenes.EDITOR && scene == GameScenes.SPACECENTER)
                 return TryStartEditorExit();
             if (HighLogic.LoadedScene == GameScenes.TRACKSTATION && scene == GameScenes.SPACECENTER)
@@ -429,6 +445,14 @@ namespace Seamless
                 BeginBase(v, fc, GameScenes.TRACKSTATION, "Tracking Station");
                 return true;
             }
+            if (scene == GameScenes.EDITOR && S.editorTransition)
+            {
+                BeginFlightToEditor(v, fc);
+                return true;
+            }
+            if (scene == GameScenes.FLIGHT && S.vesselSwitchTransition && Time.frameCount - revertLaunchFrame < 10
+                && BeginRevertToLaunch(v, fc))
+                return true;
             if (scene == GameScenes.FLIGHT && S.vesselSwitchTransition && switchTarget != null
                 && switchFrame == Time.frameCount && switchTarget != v && switchTarget.mainBody != null)
             {
@@ -639,6 +663,221 @@ namespace Seamless
             return true;
         }
 
+        private static string ModeName(Game g)
+        {
+            switch (g.Mode)
+            {
+                case Game.Modes.CAREER: return "Career";
+                case Game.Modes.SCIENCE_SANDBOX: return "Science";
+                case Game.Modes.SANDBOX: return "Sandbox";
+                default: return null;
+            }
+        }
+
+        // quit to the main menu: the camera pulls straight back along its view, gathering speed
+        private bool pullBack;
+        private double pullFrom, pullTo;
+        private const double PullSeconds = 3.0;
+
+        /// <summary>Flight / Space Center / Tracking Station / VAB / SPH -> main menu: the camera
+        /// pulls straight back along its view, gathering speed, until the planet is a speck (the
+        /// editor: no camera move); the card "Leaving <save>" holds while the menu loads, then
+        /// dissolves into it.</summary>
+        private bool TryStartQuit()
+        {
+            S = Settings.Load();
+            if (!S.enabled || !S.mainMenuTransition) return false;
+            Game g = HighLogic.CurrentGame;
+            if (g == null) return false;
+            string mode = ModeName(g);
+            if (mode == null) return false;   // missions, scenarios, tutorials
+            CelestialBody home = FlightGlobals.GetHomeBody();
+            if (home == null) return false;
+            string name = HighLogic.SaveFolder;
+            if (string.IsNullOrEmpty(name)) name = g.Title;
+            if (string.IsNullOrEmpty(name)) name = "Kerbal Space Program";
+            string date = SafeDate();
+            titleText = "Leaving " + name;
+            detailText = mode + (string.IsNullOrEmpty(date) ? "" : "   \u00b7   " + date);
+            framedBody = null;
+            lowerThird = true;
+            switchVessel = null;
+            carryValid = false;
+            travelBody = home;
+            travelCenter = null;
+            switch (HighLogic.LoadedScene)
+            {
+                case GameScenes.FLIGHT:
+                    {
+                        Vessel v = FlightGlobals.ActiveVessel;
+                        FlightCamera fc = FlightCamera.fetch;
+                        if (v == null || v.mainBody == null || fc == null || fc.GetPivot() == null || ScaledCamera.Instance == null) goto default;
+                        travelBody = v.mainBody;
+                        pullBack = true;
+                        Log.Info("quitting to the main menu from " + v.vesselName);
+                        BeginFromFlight(v, fc, GameScenes.MAINMENU, Kind.ToMainMenu);
+                        return true;
+                    }
+                case GameScenes.SPACECENTER:
+                    if (FlightCamera.fetch == null || ScaledCamera.Instance == null) goto default;
+                    pullBack = true;
+                    Log.Info("quitting to the main menu from the Space Center");
+                    BeginFromKscCamera(GameScenes.MAINMENU, Kind.ToMainMenu);
+                    return true;
+                case GameScenes.TRACKSTATION:
+                    {
+                        PlanetariumCamera pc = PlanetariumCamera.fetch;
+                        if (pc == null || ScaledCamera.Instance == null) goto default;
+                        var r = new PlanetariumRig(S, pc);
+                        Vector3d a0 = ScaledSpace.ScaledToLocalSpace(pc.transform.position);
+                        pullBack = true;
+                        Log.Info("quitting to the main menu from the Tracking Station");
+                        BeginCommon(r, () => a0, () => PlanetariumCamera.fetch == pc, NearestBody(a0, home), 10.0, false, GameScenes.MAINMENU, Kind.ToMainMenu);
+                        return true;
+                    }
+                default:
+                    staticDepart = true;
+                    Log.Info("quitting to the main menu from the " + HighLogic.LoadedScene);
+                    BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false, GameScenes.MAINMENU, Kind.ToMainMenu);
+                    return true;
+            }
+        }
+
+        private static string EditorName(EditorFacility f)
+        {
+            bool sph = f == EditorFacility.SPH;
+            return FacilityName(Facility(sph ? "SpaceplaneHangar" : "VehicleAssemblyBuilding"), sph ? "Spaceplane Hangar" : "Vehicle Assembly Building");
+        }
+
+        /// <summary>VAB / SPH -> Tracking Station, or VAB <-> SPH (QuickGoTo and similar mods):
+        /// the card comes in over the editor and that frame holds while the scene loads, then
+        /// dissolves into the new scene. The Tracking Station opens over the Space Center.</summary>
+        private bool TryStartEditorStatic(GameScenes scene, Kind k)
+        {
+            S = Settings.Load();
+            if (!S.enabled || !(scene == GameScenes.TRACKSTATION ? S.trackingStationTransition : S.editorTransition)) return false;
+            CelestialBody home = FlightGlobals.GetHomeBody();
+            if (home == null) return false;
+            if (scene == GameScenes.TRACKSTATION)
+            {
+                titleText = "Tracking Station";
+                detailText = ArrivalText.BodyName(home) + "\n" + SafeDate();
+                PlanetariumCamera pc = PlanetariumCamera.fetch;
+                if (pc != null) AimTrackingOpening(pc, KscSite(home) - home.position, "the Space Center");
+            }
+            else
+            {
+                titleText = EditorName(EditorDriver.editorFacility);
+                detailText = "Kerbal Space Center\n" + SafeDate();
+            }
+            framedBody = null;
+            lowerThird = true;
+            switchVessel = null;
+            staticDepart = true;
+            carryValid = false;
+            Log.Info("leaving the editor for the " + titleText);
+            BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false, scene, k);
+            return true;
+        }
+
+        /// <summary>VAB / SPH -> a craft already in flight (QuickGoTo's "last vessel":
+        /// FlightDriver.StartAndFocusVessel from the editor): the card with the craft's name over
+        /// the editor, then the craft's arrival shot in the flight scene, as for a switch.</summary>
+        private bool TryStartEditorToVessel()
+        {
+            S = Settings.Load();
+            if (!S.enabled || !S.vesselSwitchTransition) return false;
+            if (FlightDriver.StartupBehaviour != FlightDriver.StartupBehaviours.RESUME_SAVED_FILE
+                && FlightDriver.StartupBehaviour != FlightDriver.StartupBehaviours.RESUME_SAVED_CACHE) return false;
+            ProtoVessel pv = null;
+            try
+            {
+                Game g = FlightDriver.StartupBehaviour == FlightDriver.StartupBehaviours.RESUME_SAVED_CACHE && FlightDriver.FlightStateCache != null
+                         ? FlightDriver.FlightStateCache : HighLogic.CurrentGame;
+                int idx = FlightDriver.FocusVesselAfterLoad;
+                var list = g != null && g.flightState != null ? g.flightState.protoVessels : null;
+                if (list != null && idx >= 0 && idx < list.Count) pv = list[idx];
+            }
+            catch { }
+            if (pv == null) return false;
+            CelestialBody home = FlightGlobals.GetHomeBody();
+            CelestialBody b = null;
+            try { b = FlightGlobals.Bodies[pv.orbitSnapShot.ReferenceBodyIndex]; } catch { }
+            targetId = pv.vesselID;
+            titleText = string.IsNullOrEmpty(pv.vesselName) ? "Vessel" : pv.vesselName;
+            detailText = ProtoSituation(pv, b) + "\n" + SafeDate();
+            switchVessel = null;
+            framedBody = null;
+            lowerThird = true;
+            staticDepart = true;
+            carryValid = false;
+            Log.Info("editor -> " + titleText + " (" + (b != null ? b.bodyName : "?") + ", " + pv.situation + ")");
+            BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false, GameScenes.FLIGHT, Kind.VesselSwitch);
+            return true;
+        }
+
+        private static string ProtoSituation(ProtoVessel pv, CelestialBody b)
+        {
+            string n = b != null ? ArrivalText.BodyName(b) : "";
+            switch (pv.situation)
+            {
+                case Vessel.Situations.LANDED: return "Landed at " + n;
+                case Vessel.Situations.SPLASHED: return "Splashed down at " + n;
+                case Vessel.Situations.PRELAUNCH: return "Ready to launch at " + n;
+                case Vessel.Situations.FLYING: return "Flying over " + n;
+                case Vessel.Situations.SUB_ORBITAL: return "Sub-orbital at " + n;
+                case Vessel.Situations.ORBITING: return "Orbiting " + n;
+                case Vessel.Situations.ESCAPING: return "Escaping " + n;
+                case Vessel.Situations.DOCKED: return "Docked at " + n;
+                default: return n;
+            }
+        }
+
+        /// <summary>"Revert to launch": the camera flies from the craft to an aerial view of the
+        /// launch site, the card holds while the flight scene reloads, then the zoom down to the
+        /// craft back on the site, as for a switch to a landed craft. Not for a flight that
+        /// started off the ground (stock loading screen then).</summary>
+        private bool BeginRevertToLaunch(Vessel v, FlightCamera fc)
+        {
+            ProtoVessel pv = null;
+            try
+            {
+                Game g = FlightDriver.FlightStateCache;
+                int idx = FlightDriver.FocusVesselAfterLoad;
+                if (g != null && g.flightState != null && idx >= 0 && idx < g.flightState.protoVessels.Count) pv = g.flightState.protoVessels[idx];
+            }
+            catch { }
+            if (pv == null) return false;
+            if (pv.situation != Vessel.Situations.PRELAUNCH && pv.situation != Vessel.Situations.LANDED && pv.situation != Vessel.Situations.SPLASHED)
+            {
+                Log.Info("revert to launch: the flight started " + pv.situation + " - no transition");
+                return false;
+            }
+            CelestialBody b;
+            try { b = FlightGlobals.Bodies[pv.orbitSnapShot.ReferenceBodyIndex]; } catch { return false; }
+            double lat = pv.latitude, lon = pv.longitude, alt = pv.altitude;
+            Vector3d sitePos = b.GetWorldSurfacePosition(lat, lon, alt);
+            Shots.Aerial(S, sitePos, b, Math.Max(0.0, alt), out Vector3d off, out Quaternion rot, out Vector3 ray, out double tan);
+            Carry(b, true, off, rot, ray, tan);
+            targetId = pv.vesselID;
+            switchVessel = null;
+            switchVesselSize = Shots.VesselSize(v);
+            titleText = string.IsNullOrEmpty(pv.vesselName) ? v.vesselName : pv.vesselName;
+            detailText = "Reverting to launch\n" + (pv.situation == Vessel.Situations.PRELAUNCH ? SiteLabel(FlightDriver.LaunchSiteName) : ProtoSituation(pv, b)) + "\n" + SafeDate();
+            framedBody = null;
+            lowerThird = true;
+            travelBody = b;
+            travelSubject = () => b.GetWorldSurfacePosition(lat, lon, alt);
+            departTarget = anchor =>
+            {
+                CamPose p = Shots.ReaimOnVessel(off, rot, ray, tan);
+                return new CamPose(b.GetWorldSurfacePosition(lat, lon, alt) + p.Off - anchor, p.Rot, p.TanV);
+            };
+            Log.Info("revert to launch: " + titleText + " back to " + SiteLabel(FlightDriver.LaunchSiteName));
+            BeginFromFlight(v, fc, GameScenes.FLIGHT, Kind.RevertToLaunch);
+            return true;
+        }
+
         private static string CraftName(string path)
         {
             try
@@ -659,10 +898,10 @@ namespace Seamless
         /// <summary>Tracking Station -> Space Center: fly to the Kerbin shot with the Space Center
         /// on the visible side; after the load the camera starts there and zooms down into the
         /// Space Center view.</summary>
-        private bool TryStartTrackingToKsc()
+        private bool TryStartTrackingToKsc(GameScenes scene = GameScenes.SPACECENTER)
         {
             S = Settings.Load();
-            if (!S.enabled || !S.spaceCenterFromTrackingStation) return false;
+            if (!S.enabled || !(scene == GameScenes.EDITOR ? S.editorTransition : S.spaceCenterFromTrackingStation)) return false;
             PlanetariumCamera pc = PlanetariumCamera.fetch;
             CelestialBody home = FlightGlobals.GetHomeBody();
             if (pc == null || home == null || ScaledCamera.Instance == null) return false;
@@ -670,8 +909,8 @@ namespace Seamless
             Shot shot = ShotSolver.SolveFar(S, site, home, Shots.SunDir(home), CameraRig.Aspect);
             double sx = 2.0 * S.planetScreenX - 1.0;
             Carry(home, false, shot.Offset, shot.Rot, Vector3.forward, shot.TanV);
-            titleText = ArrivalText.BodyName(home);
-            detailText = "Kerbal Space Center\n" + SafeDate();
+            titleText = scene == GameScenes.EDITOR ? EditorName(EditorDriver.editorFacility) : ArrivalText.BodyName(home);
+            detailText = (scene == GameScenes.EDITOR ? ArrivalText.BodyName(home) : "Kerbal Space Center") + "\n" + SafeDate();
             framedBody = home;
             lowerThird = false;
             switchVessel = null;
@@ -685,8 +924,9 @@ namespace Seamless
             };
             var r = new PlanetariumRig(S, pc);
             Vector3d a0 = ScaledSpace.ScaledToLocalSpace(pc.transform.position);
-            Log.Info("Tracking Station -> Space Center");
-            BeginCommon(r, () => a0, () => PlanetariumCamera.fetch == pc, NearestBody(a0, home), 10.0, false, GameScenes.SPACECENTER, Kind.ToKsc);
+            Log.Info("Tracking Station -> " + (scene == GameScenes.EDITOR ? titleText : "Space Center"));
+            BeginCommon(r, () => a0, () => PlanetariumCamera.fetch == pc, NearestBody(a0, home), 10.0, false, scene,
+                        scene == GameScenes.EDITOR ? Kind.TrackingToEditor : Kind.ToKsc);
             return true;
         }
 
@@ -699,14 +939,8 @@ namespace Seamless
             if (!S.enabled || !S.saveLoadTransition) return false;
             Game g = HighLogic.CurrentGame;
             if (g == null) return false;
-            string mode;
-            switch (g.Mode)
-            {
-                case Game.Modes.CAREER: mode = "Career"; break;
-                case Game.Modes.SCIENCE_SANDBOX: mode = "Science"; break;
-                case Game.Modes.SANDBOX: mode = "Sandbox"; break;
-                default: return false;   // missions, scenarios, tutorials
-            }
+            string mode = ModeName(g);
+            if (mode == null) return false;   // missions, scenarios, tutorials
             string name = HighLogic.SaveFolder;
             if (string.IsNullOrEmpty(name)) name = g.Title;
             if (string.IsNullOrEmpty(name)) name = "Kerbal Space Program";
@@ -808,6 +1042,76 @@ namespace Seamless
             BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false,
                         GameScenes.SPACECENTER, Kind.EditorExit);
             return true;
+        }
+
+        /// <summary>Flight -> VAB / SPH ("Revert to VAB / SPH", or another mod's button such as
+        /// QuickGoTo's): near the Space Center the camera flies from the craft to the building's
+        /// facade, as from the Space Center; from further away (its buildings not built in the
+        /// flight scene) to the home planet's shot with the Space Center in view. The card holds
+        /// while the editor loads, then dissolves into it.</summary>
+        private void BeginFlightToEditor(Vessel v, FlightCamera fc)
+        {
+            CelestialBody home = FlightGlobals.GetHomeBody();
+            EditorFacility f = EditorDriver.editorFacility;
+            bool sph = f == EditorFacility.SPH;
+            bool revert = Time.frameCount - revertFrame < 10;
+            string fallback = sph ? "Spaceplane Hangar" : "Vehicle Assembly Building";
+            framedBody = null;
+            lowerThird = true;
+            switchVessel = null;
+            carryValid = false;
+            travelBody = home;
+            Vector3d camPos = (Vector3d)fc.transform.position;
+            FacadeShot fs = new FacadeShot();
+            bool near = NearKsc(v, home, KscSite(home), out double km) && FacadePose(f, home, camPos, out fs);
+            titleText = near ? FacilityName(fs.Fac, fallback) : fallback;
+            detailText = (revert ? "Reverting " + v.vesselName + "\n" : "") + SafeDate();
+            if (near)
+            {
+                Vector3d mid = fs.Mid, look = fs.Look, end = fs.End;
+                Quaternion endRot = fs.Rot;
+                double tan0 = fs.Tan;
+                noRise = (end - camPos).magnitude < 10000.0;
+                travelCenter = () => mid;
+                travelSubject = () => look;
+                departTarget = anchor => new CamPose(end - anchor, endRot, tan0);
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "{0} -> {1}{2} ({3}; {4:F1} km from the camera)", v.vesselName, titleText, revert ? " (revert)" : "",
+                    fs.Describe, (end - camPos).magnitude / 1000.0));
+            }
+            else
+            {
+                // the planet shot with the Space Center on the visible side (as for flight -> Space Center)
+                double sx = 2.0 * S.planetScreenX - 1.0;
+                Vector3d site = KscSite(home);
+                Shot ks = ShotSolver.SolveFar(S, site, home, Shots.SunDir(home), CameraRig.Aspect);
+                framedBody = home;
+                lowerThird = false;
+                departTarget = anchor =>
+                {
+                    Vector3d st = KscSite(home);
+                    CamPose p = Shots.Reaim(ks, st, home, sx, ks.TanV);
+                    return new CamPose(st + p.Off - anchor, p.Rot, p.TanV);
+                };
+                travelSubject = () => home.position;
+                Log.Info(v.vesselName + " -> " + titleText + (revert ? " (revert)" : "") + ": flying to " + home.bodyName
+                         + (km >= 0 ? string.Format(System.Globalization.CultureInfo.InvariantCulture, " ({0:F0} km from the Space Center)", km) : ""));
+            }
+            BeginFromFlight(v, fc, GameScenes.EDITOR, Kind.FlightToEditor);
+        }
+
+        /// <summary>A craft on the home planet close to the Space Center and low: within 100 km of
+        /// it and below 30 km (the pad, the runway, a landing nearby, a short flight).</summary>
+        private static bool NearKsc(Vessel v, CelestialBody home, Vector3d site, out double km)
+        {
+            km = -1;
+            try
+            {
+                if (v == null || home == null || v.mainBody != home) return false;
+                km = (v.GetWorldPos3D() - site).magnitude / 1000.0;
+                return km < 100.0 && v.altitude < 30000.0;
+            }
+            catch { return false; }
         }
 
         /// <summary>The Space Center's surface point (remembered from the Space Center scene;
@@ -1139,6 +1443,21 @@ namespace Seamless
             departStart = drv.Current(anchor0);
             flightLam = null;
             if (staticDepart) { turnSeconds = 0.0; travelSeconds = S.launchHoldSeconds; }
+            else if (pullBack)
+            {
+                // from the camera's distance to what it looks at out to ~1 million km (further when
+                // the nearest body is far: it ends a speck)
+                turnSeconds = 0.0;
+                travelSeconds = PullSeconds;
+                Vector3d c0 = anchor0 + departStart.Off;
+                double rc = double.MaxValue;
+                try { foreach (CelestialBody b in FlightGlobals.Bodies) if (b != null) rc = Math.Min(rc, (c0 - b.position).magnitude); } catch { }
+                if (rc == double.MaxValue) rc = 1e7;
+                pullFrom = Math.Max(5.0, departStart.Off.magnitude);
+                pullTo = Math.Max(1e9, 60.0 * rc);
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "pulling back {0:F0} m -> {1:F0} km over {2:F1} s", pullFrom, pullTo / 1000.0, PullSeconds));
+            }
             else PlanFlight(size, anchor0);
 
             InputLockManager.SetControlLock(ControlTypes.All, LockId);
@@ -1160,7 +1479,7 @@ namespace Seamless
             if (k != Kind.SaveLoad && k != Kind.Launch && k != Kind.EditorExit) FreezeTime();
             musicWasPlaying = MusicPlaying();
             musicLogged = false;
-            overlay = new Overlay(S, titleText, detailText, kind == Kind.VesselSwitch ? titleText : "", true);
+            overlay = new Overlay(S, titleText, detailText, kind == Kind.VesselSwitch || kind == Kind.RevertToLaunch ? titleText : "", true);
             frozenZoom = 1f;
             frozenPlanetOnScreen = false;
             phase = Phase.Depart;
@@ -1262,6 +1581,35 @@ namespace Seamless
             lowerThird = false;
 
             double sx = 2.0 * S.planetScreenX - 1.0;
+            bool recovery = recovering == v && Time.frameCount - recoveringFrame < 10;
+            if (scene == GameScenes.SPACECENTER && NearKsc(v, body, KscSite(body), out double kscKm))
+            {
+                // Near the Space Center (a recovery from the pad or runway, a craft landed close
+                // by): a short flight to an aerial view of the Space Center, which the scene then
+                // opens on and zooms down from - the trip out to the planet shot and back was
+                // the wrong shape, and Kerbin's far model is not loaded while a craft sits on it.
+                Vector3d site = KscSite(body);
+                Shots.Aerial(S, site, body, 0.0, out Vector3d aOff, out Quaternion aRot, out Vector3 aRay, out double aTan);
+                Carry(body, true, aOff, aRot, aRay, aTan);
+                titleText = "Kerbal Space Center";
+                detailText = (recovery ? "Recovering " + v.vesselName + "\n" : "") + ArrivalText.BodyName(body) + "\n" + SafeDate();
+                framedBody = null;
+                lowerThird = true;
+                departTarget = anchor =>
+                {
+                    Vector3d st = KscSite(body);
+                    CamPose p = Shots.ReaimOnVessel(aOff, aRot, aRay, aTan);
+                    return new CamPose(st + p.Off - anchor, p.Rot, p.TanV);
+                };
+                travelBody = body;
+                travelSubject = () => KscSite(body);
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "to the {0}: {1} {2:F0} km from it - flying to an aerial view of it ({3:F0} km up)",
+                    place, recovery ? "recovering " + v.vesselName + "," : v.vesselName + " is", kscKm, Vector3d.Dot(aOff, (site - body.position).normalized) / 1000.0));
+                BeginFromFlight(v, fc, scene, Kind.SpaceCenter);
+                return;
+            }
+            if (recovery) detailText = "Recovering " + v.vesselName + "\n" + detailText;
             if (scene == GameScenes.SPACECENTER)
             {
                 // the shot the Space Center scene opens on (carried across the load), with the
@@ -1729,12 +2077,21 @@ namespace Seamless
         private double Tick() { return Math.Min(Time.unscaledDeltaTime, 1.0 / 30.0) * Speed(); }
         private double Speed() { return S != null ? 1.0 / Math.Max(0.25, (double)S.transitionTimeScale) : 1.0; }
 
+        /// <summary>QuickGoTo calls InputLockManager.ClearControlLocks() right after its scene call,
+        /// which took our lock away for the departure (keys reached the camera and the craft).</summary>
+        private static void KeepLocked()
+        {
+            try { if (InputLockManager.GetControlLock(LockId) == ControlTypes.None) InputLockManager.SetControlLock(ControlTypes.All, LockId); }
+            catch { }
+        }
+
         private void Step()
         {
             switch (phase)
             {
                 case Phase.Depart:
                     t += Tick();
+                    KeepLocked();
                     WatchMusic();
                     HoldVessels();
                     if (S.frameProbe && directFlight && departApplied && !probeStarted && FlightU(t + 0.05) >= directSwitchU) StartSwitchProbe();
@@ -1801,6 +2158,23 @@ namespace Seamless
                 return;
             }
             Vector3d anchor = departAnchor();
+            Vector3d cam;
+            Quaternion rot;
+            double tanV, weight;
+            if (pullBack)
+            {
+                // straight back along the view, slow at first and ever faster (log distance ~ s^2)
+                double s = Math.Min(1.0, t / Math.Max(0.1, turnSeconds + travelSeconds));
+                double d = pullFrom * (Math.Exp(Math.Log(pullTo / pullFrom) * s * s) - 1.0);
+                Vector3d back = (Vector3d)(departStart.Rot * Vector3.back);
+                cam = anchor + departStart.Off + back * d;
+                rot = departStart.Rot;
+                tanV = departStart.TanV;
+                weight = 0.0;
+                departApplied = true;
+            }
+            else
+            {
             // the turn starts at once and settles (ease-out): an ease-in read as "not moving yet"
             double tw = Math.Min(1.0, t / Math.Max(0.05, S.departTurnSeconds));
             turnW = 1.0 - (1.0 - tw) * (1.0 - tw) * (1.0 - tw);
@@ -1808,7 +2182,8 @@ namespace Seamless
             if (directFlight) u = Math.Min(u, directSwitchU);   // the rest is flown as the arrival
             lastU = u;
             departApplied = true;
-            DepartPoseAt(u, anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight);
+            DepartPoseAt(u, anchor, out cam, out rot, out tanV, out weight);
+            }
             cam = TerrainClamp(cam);
             drv.Apply(cam, rot, tanV, weight);
             if (HighLogic.LoadedScene == GameScenes.SPACECENTER && drv is CameraRig)
@@ -2202,7 +2577,7 @@ namespace Seamless
             Milestone("scene shown");
 
             Vessel av = FlightGlobals.ActiveVessel;
-            if (kind == Kind.VesselSwitch && av != null && av.id == targetId)
+            if ((kind == Kind.VesselSwitch || kind == Kind.RevertToLaunch) && av != null && av.id == targetId)
                 BeginArrive(av);
             else if (kind == Kind.Launch && av != null && HighLogic.LoadedSceneIsFlight)
                 BeginArrive(av);
@@ -2218,7 +2593,7 @@ namespace Seamless
         /// stays until then (at most 10 s after the scene could be shown).</summary>
         private bool GroundNotReady()
         {
-            if (kind != Kind.VesselSwitch || targetScene != GameScenes.FLIGHT) return false;
+            if ((kind != Kind.VesselSwitch && kind != Kind.RevertToLaunch) || targetScene != GameScenes.FLIGHT) return false;
             Vessel av = FlightGlobals.ActiveVessel;
             if (av == null || av.id != targetId || !Shots.SurfaceLike(av)) return false;
             if (!av.packed || HeldByPhysicsHold(av) || Ready()) return false;
@@ -2928,6 +3303,9 @@ namespace Seamless
         /// the card covered the screen). The flight camera is a child of that camera's transform,
         /// at zero offset: put back there at the end, the hand-over has no jump.
         /// </summary>
+        private bool kscAerial;
+        private Vector3 kscRay;
+
         private void BeginArriveKsc()
         {
             FlightCamera fc = FlightCamera.fetch;
@@ -2941,7 +3319,17 @@ namespace Seamless
             // the save card sits in the lower left corner: Kerbin on the right third, clear of it
             kscSx = lowerThird ? 1.0 - 2.0 * S.planetScreenX : 2.0 * S.planetScreenX - 1.0;
             Quaternion q = BodyRotation(home);
-            if (carryValid && carryBody == home && !carryAerial)
+            kscAerial = false;
+            if (carryValid && carryBody == home && carryAerial)
+            {
+                // a short flight from near the Space Center: its aerial view
+                kscAerial = true;
+                kscOffB = carryOff;
+                kscRotB = carryRot;
+                kscRay = carryRay;
+                kscTan = carryTanV;
+            }
+            else if (carryValid && carryBody == home && !carryAerial)
             {
                 kscOffB = carryOff;
                 kscRotB = carryRot;
@@ -3009,6 +3397,13 @@ namespace Seamless
             anchor = kscScc != null ? (Vector3d)kscScc.transform.position : (Vector3d)kscCt.position;
             to = new CamPose((Vector3d)kscCt.position - anchor, kscCt.rotation, kscHomeTan);
             Quaternion q = BodyRotation(home);
+            if (kscAerial)
+            {
+                CamPose pa = Shots.ReaimOnVessel((Vector3d)(q * (Vector3)kscOffB), q * kscRotB, kscRay, kscTan);
+                Vector3d st = KscSite(home);
+                from = new CamPose(st + pa.Off - anchor, pa.Rot, pa.TanV);
+                return;
+            }
             var shot = new Shot { Mode = "ksc", Offset = (Vector3d)(q * (Vector3)kscOffB), Rot = q * kscRotB, TanV = kscTan };
             Vector3d site = KscSite(home);
             CamPose start = Shots.Reaim(shot, site, home, kscSx, shot.TanV);
@@ -3479,6 +3874,16 @@ namespace Seamless
             uiHidden = true;
         }
 
+        // the craft whose recovery was just asked for (KSP saves and loads the Space Center next)
+        private Vessel recovering;
+        private int recoveringFrame = -100;
+        private void OnRecoveryRequested(Vessel v) { recovering = v; recoveringFrame = Time.frameCount; }
+        // "Revert to VAB / SPH" was just asked for (KSP saves the pre-launch state and loads the editor next)
+        private int revertFrame = -100;
+        private void OnRevertToPrelaunch(FlightState fs) { revertFrame = Time.frameCount; }
+        private int revertLaunchFrame = -100;
+        private void OnRevertToLaunch(FlightState fs) { revertLaunchFrame = Time.frameCount; }
+
         private void OnLauncherReady()
         {
             if (phase != Phase.Idle && uiHidden) rehideUi = true;
@@ -3562,7 +3967,9 @@ namespace Seamless
             noRise = false;
             riseRequired = false;
             staticDepart = false;
+            pullBack = false;
             inSceneSwitch = false;
+            recovering = null;
             if (preloadRanges != null && inSceneTarget != null)
                 try { inSceneTarget.vesselRanges = preloadRanges; } catch { }   // loaded ahead, never switched to
             preloadRanges = null;

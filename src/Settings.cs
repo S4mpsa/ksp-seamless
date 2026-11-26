@@ -54,6 +54,7 @@ namespace Seamless
         public float launchHoldSeconds = 0.5f;     // bars + card over the editor before the load
         public bool spaceCenterFromTrackingStation = true; // Tracking Station -> Space Center
         public bool saveLoadTransition = true;     // main menu -> a save's Space Center
+        public bool mainMenuTransition = true;     // quitting to the main menu
         public float saveHoldSeconds = 0.5f;       // the Kerbin shot holds this long before the zoom down
         public float settleQuietSeconds = 0.5f;      // Space Center arrivals: the scene counts as settled after this long with no log output
         public float settleMaxSeconds = 30f;       // ... or after this long regardless
@@ -146,6 +147,7 @@ namespace Seamless
                 Float(n, "launchHoldSeconds", ref s.launchHoldSeconds);
                 Bool(n, "spaceCenterFromTrackingStation", ref s.spaceCenterFromTrackingStation);
                 Bool(n, "saveLoadTransition", ref s.saveLoadTransition);
+                Bool(n, "mainMenuTransition", ref s.mainMenuTransition);
                 Float(n, "saveHoldSeconds", ref s.saveHoldSeconds);
                 Float(n, "settleQuietSeconds", ref s.settleQuietSeconds);
                 Float(n, "settleMaxSeconds", ref s.settleMaxSeconds);
