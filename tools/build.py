@@ -192,7 +192,7 @@ def main():
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     opts = ["/nologo", "/target:library", "/langversion:7.3", "/nostdlib+",
-            "/nowarn:CS0612,CS0618,CS1701,CS1702", "/optimize+", "/debug-", "/out:" + str(OUT)]
+            "/nowarn:CS0612,CS0618,CS1701,CS1702", "/optimize+", "/debug-", "/deterministic+", "/out:" + str(OUT)]
     lines = ['"%s"' % o for o in opts]
     harmony = Path(ksp) / "GameData" / "000_Harmony" / "0Harmony.dll"
     if not harmony.is_file():

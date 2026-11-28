@@ -7,6 +7,9 @@ tools/build.rsp
 tools/sdfgen/bin/
 tools/sdfgen/obj/
 
+# local handoff notes (install paths, personal-use patches of other mods - never published)
+NOTES.md
+
 # local deploy bookkeeping (hashes of settings.cfg versions shipped to the installs)
 tools/shipped-settings.sha256
 

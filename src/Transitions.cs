@@ -190,6 +190,19 @@ namespace Seamless
         private CelestialBody framedBody;      // planet in the frozen frame (leader-line layout), or null
         private Vector3d lastCam;
         private Quaternion lastRot;
+        // every transition camera rotation goes through this: capped turning speed / acceleration
+        private readonly TurnLimiter turn = new TurnLimiter();
+        private const double TurnSettleMax = 1.0;   // transition seconds a move may run on for the camera to catch up
+
+        /// <summary>Detail for checking a transition by its log; only with debugLog on.</summary>
+        private void Diag(string m) { if (S != null && S.debugLog) Log.Info(m); }
+
+        private Quaternion Turn(Quaternion target)
+        {
+            turn.MaxRate = S != null ? S.maxTurnRate * Math.PI / 180.0 : 0.0;
+            turn.MaxAccel = S != null ? S.maxTurnAccel * Math.PI / 180.0 : 0.0;
+            return turn.Step(target, Speed());
+        }
         private double lastTanV;
 
         // frozen frame / text
@@ -631,9 +644,316 @@ namespace Seamless
             framedBody = null;
             lowerThird = true;
             staticDepart = true;
+            launchCarry = false;
+            doorLook = PlanDoorLook(launchFacility);
             Log.Info("launching " + name + " from " + launchFacility + " to " + FlightDriver.LaunchSiteName);
             BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false, GameScenes.FLIGHT, Kind.Launch);
             return true;
+        }
+
+        // Launch from the VAB / SPH: before the card freezes the editor, the camera turns (and moves
+        // in a little) to look out of the building's open doors, towards the launch pad / runway.
+        private bool doorLook;
+        private Transform doorCam;
+        private Vector3 doorFromPos, doorToPos;
+        private double doorFromTan, doorToTan;
+        // the door look's end against the pad, carried into the flight scene's opening shot
+        private bool launchCarry;
+        private Vector3 launchRelPos;
+        private Quaternion launchRelRot;
+        private double launchTan;
+        private Quaternion doorFromRot, doorToRot;
+        private Behaviour[] doorCamDrivers;
+
+        /// <summary>Finds the open side of the building: rays from the middle of the build space out
+        /// in 72 directions at a few heights against the building's colliders (the craft's own parts
+        /// left out); the doors are the widest run of directions that reach far or nothing. The
+        /// camera's end pose: halfway from the middle towards the doors, at the opening's height,
+        /// looking straight out. vabDoorHeading / sphDoorHeading override the direction.</summary>
+        private bool PlanDoorLook(EditorFacility fac)
+        {
+            doorCamDrivers = null;
+            try
+            {
+                if (S.launchDoorSeconds <= 0f) return false;
+                EditorCamera ec = EditorCamera.Instance;
+                Camera c = ec != null ? ec.cam : null;
+                if (c == null) c = Camera.main;
+                if (c == null) { Log.Info("door look: no editor camera"); return false; }
+                EditorBounds eb = EditorBounds.Instance;
+                Bounds cb = eb != null ? eb.constructionBounds : new Bounds(Vector3.zero, new Vector3(60f, 60f, 60f));
+                Vector3 centre = cb.center;
+                float floorY = cb.min.y;
+                if (Physics.Raycast(new Vector3(centre.x, cb.max.y, centre.z), Vector3.down, out RaycastHit fh, cb.size.y * 2f + 50f, ~0, QueryTriggerInteraction.Ignore)
+                    && !IsPart(fh.collider))
+                    floorY = fh.point.y;
+                const int N = 72;
+                float[] heights = { 3f, 8f, 15f, 25f, 40f };
+                const float far = 600f;
+                var reach = new float[heights.Length, N];
+                int hitsAny = 0;
+                for (int h = 0; h < heights.Length; h++)
+                    for (int i = 0; i < N; i++)
+                    {
+                        Vector3 o = new Vector3(centre.x, floorY + heights[h], centre.z);
+                        Vector3 d = Quaternion.AngleAxis(i * 360f / N, Vector3.up) * Vector3.forward;
+                        float r = far;
+                        foreach (RaycastHit hit in Physics.RaycastAll(o, d, far, ~0, QueryTriggerInteraction.Ignore))
+                        {
+                            if (hit.collider == null || IsPart(hit.collider)) continue;
+                            if (hit.distance < r) r = hit.distance;
+                        }
+                        if (r < far) hitsAny++;
+                        reach[h, i] = r;
+                    }
+                // per direction: the best reach over the heights, and the heights it got out at
+                var best = new float[N];
+                for (int i = 0; i < N; i++)
+                    for (int h = 0; h < heights.Length; h++) best[i] = Math.Max(best[i], reach[h, i]);
+                float wall = float.MaxValue;
+                for (int i = 0; i < N; i++) wall = Math.Min(wall, best[i]);
+                var sb = new System.Text.StringBuilder();
+                for (int i = 0; i < N; i += 6) sb.Append(string.Format(System.Globalization.CultureInfo.InvariantCulture, " {0}:{1:F0}", i * 5, best[i]));
+                Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "door look ({0}): build space centre {1}, floor {2:F1}, {3} of {4} rays hit the building; reach by heading (deg:m){5}",
+                    fac, centre, floorY, hitsAny, heights.Length * N, sb));
+
+                Vector3 camFwd = c.transform.forward;
+                Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "door look: the editor camera faces heading {0:F0} deg (pitch {1:F0})",
+                    Mathf.Atan2(camFwd.x, camFwd.z) * Mathf.Rad2Deg, Mathf.Asin(Mathf.Clamp(camFwd.y, -1f, 1f)) * Mathf.Rad2Deg));
+                float headingDeg;
+                float overrideDeg = fac == EditorFacility.SPH ? S.sphDoorHeading : S.vabDoorHeading;
+                float meshDeg = FindLaunchSite(centre, cb, fac, out Vector3 lookAt, out bool padFound);
+                if (!float.IsNaN(overrideDeg)) headingDeg = overrideDeg;
+                else if (hitsAny < N && !float.IsNaN(meshDeg)) headingDeg = meshDeg;
+                else
+                {
+                    if (hitsAny < N) { Log.Info("door look: too few building colliders and no door meshes to find the doors - no camera move"); return false; }
+                    // the widest run of "open" directions (reach well beyond the walls)
+                    float open = Math.Max(2.5f * wall, 0.5f * far);
+                    int bestStart = -1, bestLen = 0;
+                    for (int i = 0; i < N; i++)
+                    {
+                        if (best[i] < open || best[(i + N - 1) % N] >= open) continue;   // run starts here
+                        int len = 0;
+                        while (len < N && best[(i + len) % N] >= open) len++;
+                        if (len > bestLen) { bestLen = len; bestStart = i; }
+                    }
+                    if (bestStart < 0 || bestLen >= N - 2) { Log.Info("door look: no single opening found - no camera move"); return false; }
+                    headingDeg = (bestStart + (bestLen - 1) * 0.5f) * 360f / N;
+                }
+                Vector3 dir = Quaternion.AngleAxis(headingDeg, Vector3.up) * Vector3.forward;
+                int k = Mathf.RoundToInt(headingDeg / (360f / N)) % N;
+                if (k < 0) k += N;
+                // the opening's height: the mean of the heights that get out along it
+                float hy = 0f; int hn = 0;
+                for (int h = 0; h < heights.Length; h++) if (reach[h, k] >= Math.Max(2.5f * wall, 0.5f * far)) { hy += heights[h]; hn++; }
+                float eye = hn > 0 && hn < heights.Length ? hy / hn : Math.Min(15f, 0.3f * cb.size.y);
+                // how far the doors are: the nearest wall either side of the opening
+                float doorDist = float.MaxValue;
+                for (int j = -12; j <= 12; j++)
+                {
+                    int ii = ((k + j) % N + N) % N;
+                    float a = Math.Abs(j) * 360f / N * Mathf.Deg2Rad;
+                    for (int h = 0; h < heights.Length; h++)
+                        if (reach[h, ii] < far) doorDist = Math.Min(doorDist, reach[h, ii] * Mathf.Cos(a));
+                }
+                if (doorDist == float.MaxValue || doorDist < 5f) doorDist = Math.Max(10f, Vector3.Scale(cb.extents, new Vector3(Math.Abs(dir.x), 0f, Math.Abs(dir.z))).magnitude);
+                doorCam = c.transform;
+                doorFromPos = doorCam.position;
+                doorFromRot = doorCam.rotation;
+                doorToPos = new Vector3(centre.x, floorY + eye, centre.z) + dir * (0.5f * doorDist);
+                doorToRot = Quaternion.LookRotation(dir, Vector3.up);
+                doorFromTan = Math.Tan(c.fieldOfView * 0.5 * Math.PI / 180.0);
+                doorToTan = Math.Tan(S.cameraFov * 0.5 * Math.PI / 180.0);
+                launchCarry = false;
+                if (float.IsNaN(overrideDeg) && !float.IsNaN(meshDeg) && hitsAny < N && !float.IsNaN(lookAt.x))
+                {
+                    // at the launch site itself, out through the doors - framed as the flight scene's
+                    // opening shot frames the craft (just below the middle, at its FOV)
+                    Vector3 to = lookAt - doorToPos;
+                    if (to.sqrMagnitude > 1f)
+                    {
+                        Vector3d ray = ShotSolver.Ray(0.0, -0.05, doorToTan, c.aspect);
+                        doorToRot = ShotSolver.AimAnyRay((Vector3d)to, ray, (Vector3d)Vector3.up);
+                    }
+                    if (padFound)
+                    {
+                        // the pose against the pad (forward = from the pad towards the building), for the
+                        // flight scene to open on the same view of the real pad
+                        Vector3 fw = centre - lookAt; fw.y = 0f;
+                        if (fw.sqrMagnitude > 1f)
+                        {
+                            Quaternion F = Quaternion.LookRotation(fw.normalized, Vector3.up);
+                            launchRelPos = Quaternion.Inverse(F) * (doorToPos - lookAt);
+                            launchRelRot = Quaternion.Inverse(F) * doorToRot;
+                            launchTan = doorToTan;
+                            launchCarry = true;
+                            Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                                "door look: ends {0:F0} m from the pad, {1:F0} m above its deck - the flight scene opens on the same view",
+                                new Vector3(launchRelPos.x, 0f, launchRelPos.z).magnitude, launchRelPos.y));
+                        }
+                    }
+                }
+                // the editor's own camera control would pull it back every frame
+                var drivers = new System.Collections.Generic.List<Behaviour>();
+                foreach (Behaviour b in new Behaviour[] { UnityEngine.Object.FindObjectOfType<VABCamera>(), UnityEngine.Object.FindObjectOfType<SPHCamera>() })
+                    if (b != null && b.enabled) { b.enabled = false; drivers.Add(b); }
+                doorCamDrivers = drivers.ToArray();
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "door look: doors at heading {0:F0} deg{1}, {2:F0} m out, opening ~{3:F0} m up; camera from {4} to {5} over {6:F1} s",
+                    headingDeg, float.IsNaN(overrideDeg) ? "" : " (setting)", doorDist, eye, doorFromPos, doorToPos, S.launchDoorSeconds));
+                return true;
+            }
+            catch (Exception e) { Log.Warn("door look: " + e.Message); return false; }
+        }
+
+        /// <summary>Where the launch site is in the editor scene: the scenery outside the building
+        /// (the backdrop seen through the doors - the pad / runway with its surroundings). First
+        /// renderers named for the facility's site (VAB: "pad" / "launch", SPH: "runway"), then
+        /// "door", else the direction the far scenery clusters in (the backdrop is only modelled
+        /// where the doors look out). Returns the heading (deg, NaN if none) and the point to look
+        /// at (NaN when only a direction is known). Logs what it found.</summary>
+        /// <summary>"pad" as a word ("obj_pad", "ksp_pad_tank", "launchpad"), not inside another one
+        /// ("sciNotepad").</summary>
+        private static bool IsPadName(string lower)
+        {
+            if (lower.Contains("launchpad") || lower.Contains("launch_pad")) return true;
+            for (int i = lower.IndexOf("pad", StringComparison.Ordinal); i >= 0; i = lower.IndexOf("pad", i + 1, StringComparison.Ordinal))
+            {
+                bool before = i == 0 || !char.IsLetter(lower[i - 1]);
+                bool after = i + 3 >= lower.Length || !char.IsLetter(lower[i + 3]);
+                if (before && after) return true;
+            }
+            return false;
+        }
+
+        private float FindLaunchSite(Vector3 centre, Bounds cb, EditorFacility fac, out Vector3 lookAt, out bool padFound)
+        {
+            padFound = false;
+            lookAt = new Vector3(float.NaN, float.NaN, float.NaN);
+            try
+            {
+                float inside = Math.Max(150f, 2f * Math.Max(cb.extents.x, cb.extents.z));
+                var named = new System.Text.StringBuilder();
+                var far = new System.Collections.Generic.List<KeyValuePair<string, Bounds>>();
+                Renderer door = null;
+                double doorSize = 0.0;
+                // the editor's backdrop is within a few km; the real Space Center (kept loaded on the
+                // planet, 400-700 km from the editor's origin) is not part of it - looking at it put the
+                // camera's view into the ground
+                const float backdrop = 20000f;
+                Vector3 siteSum = Vector3.zero;
+                int siteN = 0;
+                Renderer pad = null;
+                double padSize = 0.0;
+                int listed = 0;
+                // every loaded scene: with the scene preloaded the editor's objects are not in the
+                // "active" one (the first try found no renderers at all)
+                Renderer[] all = UnityEngine.Object.FindObjectsOfType<Renderer>();
+                int nearCount = 0, farAway = 0;
+                foreach (Renderer r in all)
+                    {
+                        if (r == null || !r.enabled || !r.gameObject.activeInHierarchy || r is ParticleSystemRenderer || r.GetComponentInParent<Part>() != null) continue;
+                        Bounds rb = r.bounds;
+                        Vector3 d = rb.center - centre;
+                        float hdist = new Vector3(d.x, 0f, d.z).magnitude;
+                        if (hdist > backdrop) { farAway++; continue; }
+                        string n = r.gameObject.name, pn = r.transform.parent != null ? r.transform.parent.name : "";
+                        string both = (n + "/" + pn).ToLowerInvariant();
+                        bool isPad = IsPadName(both), isRunway = both.Contains("runway");
+                        bool isSite = fac == EditorFacility.SPH ? isRunway : isPad;
+                        bool isDoor = both.Contains("door");
+                        if ((isSite || isDoor || isRunway || isPad) && listed++ < 20)
+                            named.Append(string.Format(System.Globalization.CultureInfo.InvariantCulture, " '{0}/{1}' {2:F0} deg {3:F0} m size {4:F0};",
+                                pn, n, Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg, hdist, rb.size.magnitude));
+                        if (isSite && hdist > inside) { siteSum += rb.center; siteN++; }
+                        // the pad itself (the craft stands on its middle): "obj_pad" / a "launchpad" parent
+                        if (fac != EditorFacility.SPH && hdist > inside && (n.ToLowerInvariant() == "obj_pad" || pn.ToLowerInvariant().Contains("launchpad"))
+                            && rb.size.magnitude > padSize) { padSize = rb.size.magnitude; pad = r; }
+                        if (isDoor && hdist > 5f && rb.size.magnitude > doorSize) { doorSize = rb.size.magnitude; door = r; }
+                        // far scenery: outside the building, not the whole terrain or the sky
+                        if (hdist > inside && rb.size.magnitude < backdrop) far.Add(new KeyValuePair<string, Bounds>(pn + "/" + n, rb));
+                        else nearCount++;
+                    }
+                Diag("door look: " + all.Length + " renderers loaded, " + farAway + " beyond the backdrop (the planet's own Space Center), " + nearCount + " inside / huge; named scenery (" + listed + "):" + (listed > 0 ? named.ToString() : " none"));
+
+                if (siteN > 0)
+                {
+                    // the middle of the site's pieces (pad, tower, tanks / the runway and its lights);
+                    // the pad's deck when it is there
+                    lookAt = siteSum / siteN;
+                    if (pad != null)
+                    {
+                        Bounds pb = pad.bounds;
+                        lookAt = new Vector3(pb.center.x, pb.max.y, pb.center.z);
+                        Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                            "door look: the pad '{0}/{1}' deck at {2}", pad.transform.parent != null ? pad.transform.parent.name : "", pad.gameObject.name, lookAt));
+                    }
+                    padFound = pad != null;
+                    Vector3 d = lookAt - centre;
+                    float h = Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg;
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "door look: the launch site in the scenery: {0} pieces around {1}, at {2:F0} deg, {3:F0} m, {4:F0} m below the build space centre",
+                        siteN, lookAt, h, new Vector3(d.x, 0f, d.z).magnitude, centre.y - lookAt.y));
+                    return h < 0f ? h + 360f : h;
+                }
+                if (door != null)
+                {
+                    Vector3 d = door.bounds.center - centre;
+                    float h = Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg;
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture, "door look: the doors: '{0}' at {1:F0} deg", door.gameObject.name, h));
+                    return h < 0f ? h + 360f : h;
+                }
+                // the far scenery's direction (unit vectors, so one big piece does not dominate)
+                Vector3 sum = Vector3.zero, pt = Vector3.zero;
+                foreach (var kv in far)
+                {
+                    Vector3 d = kv.Value.center - centre;
+                    d.y = 0f;
+                    sum += d.normalized;
+                    pt += kv.Value.center;
+                }
+                var farList = new System.Text.StringBuilder();
+                for (int i = 0; i < far.Count && i < 15; i++)
+                {
+                    Vector3 d = far[i].Value.center - centre;
+                    farList.Append(string.Format(System.Globalization.CultureInfo.InvariantCulture, " '{0}' {1:F0} deg {2:F0} m;",
+                        far[i].Key, Mathf.Atan2(d.x, d.z) * Mathf.Rad2Deg, new Vector3(d.x, 0f, d.z).magnitude));
+                }
+                double agree = far.Count > 0 ? sum.magnitude / far.Count : 0.0;
+                Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "door look: {0} renderers outside the building (beyond {1:F0} m), agreeing {2:F2}:{3}", far.Count, inside, agree, farList));
+                if (far.Count >= 3 && agree >= 0.5)
+                {
+                    float h = Mathf.Atan2(sum.x, sum.z) * Mathf.Rad2Deg;
+                    lookAt = pt / far.Count;
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture, "door look: the scenery lies at {0:F0} deg", h));
+                    return h < 0f ? h + 360f : h;
+                }
+            }
+            catch (Exception e) { Log.Warn("door look: scenery: " + e.Message); }
+            return float.NaN;
+        }
+
+        private static bool IsPart(Collider c)
+        {
+            try { return c.GetComponentInParent<Part>() != null; } catch { return false; }
+        }
+
+        private void ApplyDoorLook()
+        {
+            if (doorCam == null) return;
+            double s = Overlay.Ease((float)Math.Min(1.0, t / Math.Max(0.1, S.launchDoorSeconds)));
+            Vector3 pos = Vector3.Lerp(doorFromPos, doorToPos, (float)s);
+            // smooth by itself: through the turn limiter it lagged, overshot as the move stopped and
+            // turned back ("a correction" at the end)
+            Quaternion rot = Quaternion.Slerp(doorFromRot, doorToRot, (float)s);
+            doorCam.SetPositionAndRotation(pos, rot);
+            double tan = Math.Exp(Math.Log(doorFromTan) + (Math.Log(doorToTan) - Math.Log(doorFromTan)) * s);
+            Camera dc = doorCam.GetComponent<Camera>();
+            if (dc != null && tan > 0.0) dc.fieldOfView = (float)(2.0 * Math.Atan(tan) * 180.0 / Math.PI);
         }
 
         /// <summary>
@@ -657,6 +977,7 @@ namespace Seamless
             lowerThird = true;
             staticDepart = true;
             carryValid = false;
+            launchCarry = false;
             Log.Info("launching " + name + " (" + launchFacility + ") to " + FlightDriver.LaunchSiteName + " from the "
                      + (HighLogic.LoadedScene == GameScenes.SPACECENTER ? "Space Center" : "Tracking Station"));
             BeginCommon(new NullDriver(), () => Vector3d.zero, () => true, home, 10.0, false, GameScenes.FLIGHT, Kind.Launch);
@@ -935,6 +1256,7 @@ namespace Seamless
         /// opens on a Kerbin shot and zooms down into its own view.</summary>
         private bool TryStartSaveLoad()
         {
+            menuViewValid = false;
             S = Settings.Load();
             if (!S.enabled || !S.saveLoadTransition) return false;
             Game g = HighLogic.CurrentGame;
@@ -950,7 +1272,7 @@ namespace Seamless
             try { date = KSPUtil.PrintDate(ut, false); } catch { date = ""; }
             titleText = name;
             var saveLines = new List<string> { mode + (string.IsNullOrEmpty(date) ? "" : "   \u00b7   " + date) };
-            saveLines.AddRange(CardFacts.Save(g, ut, kscLat, kscLon));
+            saveLines.AddRange(CardFacts.Save(g));
             detailText = string.Join("\n", saveLines.ToArray());
             framedBody = null;
             lowerThird = true;
@@ -1371,6 +1693,38 @@ namespace Seamless
             return true;
         }
 
+        /// <summary>The editor's last view (its pose against the backdrop's pad, forward = from the pad
+        /// towards the building) on the real pad: the craft's lowest point stands for the deck,
+        /// forward from it towards the VAB.</summary>
+        private bool LaunchCarryPose(Vessel v, Vector3d anchor, out CamPose pose)
+        {
+            pose = default(CamPose);
+            launchCarry = false;
+            try
+            {
+                if (launchFacility == EditorFacility.SPH) return false;
+                var fac = Facility("VehicleAssemblyBuilding");
+                if (fac == null || fac.facilityTransform == null) return false;
+                if (!BuildingBox(fac.facilityTransform, out Vector3d bc, out Vector3 ext, out Quaternion brot)) return false;
+                CelestialBody b = v.mainBody;
+                Vector3d up = (anchor - b.position).normalized;
+                Vector3d fw = bc - anchor;
+                fw -= up * Vector3d.Dot(fw, up);
+                if (fw.sqrMagnitude < 100.0 || fw.magnitude > 5000.0) return false;   // another launch site
+                double low = 0.0;
+                foreach (Part pt in v.parts)
+                    if (pt != null) low = Math.Min(low, Vector3d.Dot((Vector3d)pt.transform.position - anchor, up));
+                Vector3d deck = anchor + up * (low - 1.0);
+                Quaternion F = Quaternion.LookRotation((Vector3)fw.normalized, (Vector3)up);
+                Vector3d cam = deck + (Vector3d)(F * launchRelPos);
+                pose = new CamPose(cam - anchor, F * launchRelRot, launchTan);
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "launch shot: the editor's last view of the pad, {0:F0} m from the craft", (cam - anchor).magnitude));
+                return true;
+            }
+            catch (Exception e) { Log.Warn("launch shot from the editor's view: " + e.Message); return false; }
+        }
+
         private static CelestialBody NearestBody(Vector3d p, CelestialBody fallback)
         {
             CelestialBody best = fallback;
@@ -1442,7 +1796,7 @@ namespace Seamless
             Vector3d anchor0 = anchorFn();
             departStart = drv.Current(anchor0);
             flightLam = null;
-            if (staticDepart) { turnSeconds = 0.0; travelSeconds = S.launchHoldSeconds; }
+            if (staticDepart) { turnSeconds = 0.0; travelSeconds = Math.Max(S.launchHoldSeconds, doorLook ? S.launchDoorSeconds : 0.0); }
             else if (pullBack)
             {
                 // from the camera's distance to what it looks at out to ~1 million km (further when
@@ -1482,6 +1836,7 @@ namespace Seamless
             overlay = new Overlay(S, titleText, detailText, kind == Kind.VesselSwitch || kind == Kind.RevertToLaunch ? titleText : "", true);
             frozenZoom = 1f;
             frozenPlanetOnScreen = false;
+            turn.Reset();
             phase = Phase.Depart;
             preloaded = S.preloadScene && !inSceneSwitch && ScenePreload.Start(scene);
             if (preloaded && S.dynamicTiming)
@@ -1892,7 +2247,10 @@ namespace Seamless
             double tanV = Math.Tan(S.cameraFov * 0.5 * Math.PI / 180.0);
             Vector3d subject = travelSubject();
             Vector3d Pd = departBody.position;
-            safeRadius = departBody.Radius + Math.Max(0.05 * departBody.Radius, 10000.0);   // above any terrain
+            // above any terrain; a star's glare fills the view long before its surface (the
+            // Sun -> Kerbin flight skimmed the photosphere, showcase video 2026-11-26)
+            safeRadius = departBody.isStar ? 3.0 * departBody.Radius
+                                           : departBody.Radius + Math.Max(0.05 * departBody.Radius, 10000.0);
             double rv = Math.Max(1.0, (anchor - Pd).magnitude);
             Vector3d uV = (anchor - Pd) / rv;
             bool sameBody = travelBody == departBody;
@@ -1910,18 +2268,36 @@ namespace Seamless
             // first rise to a clear point well above the terrain, swung around the planet just far
             // enough that the way to the destination clears it; only then the zoom.
             bool low = rv < safeRadius;
-            bool blocked = !sameBody && !SegmentClears(anchor + off, subject, Pd, safeRadius);
+            // a subject above this planet's surface (a craft in orbit of it) counts too: without the
+            // swing below, the zoom to a craft on the far side went through the planet, was pushed
+            // along its surface by the floor and jumped 347 km where the push flipped sides
+            // (pad -> Kerbin orbit, frame probe 2026-11-28)
+            double rSubject = (subject - Pd).magnitude;
+            bool subjectAbove = !sameBody || rSubject > departBody.Radius * 1.01;
+            bool blocked = subjectAbove && !SegmentClears(anchor + off, subject, Pd, safeRadius);
             bool clear = !noRise && (low || blocked);
             riseRequired = clear;
             if (clear)
             {
                 double rm = Math.Max(rv, 1.3 * safeRadius);
-                Vector3d dirM = uV;
-                if (!sameBody)
+                // the same planet, not a direct flight (the Space Center's aerial view after a
+                // recovery): rise only to the end's height - it went up to 219 km and back to 46 km
+                bool directPlanned = inSceneSwitch && switchVessel != null && travelCenter != null;
+                if (sameBody && !directPlanned)
                 {
+                    double endR = (anchor + departTarget(anchor).Off - Pd).magnitude;
+                    rm = Math.Max(rv, Math.Min(rm, Math.Max(safeRadius, endR)));
+                }
+                Vector3d dirM = uV;
+                if (subjectAbove)
+                {
+                    // swung around the planet until the line from the clear point to the subject
+                    // clears it: the two tangent angles (from the clear point and from the subject;
+                    // a far subject gives 90 deg, the old rule), less 5 deg
                     Vector3d tdir = (subject - Pd).normalized;
                     double theta = Math.Acos(Math.Max(-1.0, Math.Min(1.0, Vector3d.Dot(uV, tdir))));
-                    double thetaMax = Math.PI - Math.Asin(Math.Min(1.0, safeRadius / rm)) - 5.0 * Math.PI / 180.0;
+                    double thetaMax = Math.Acos(Math.Min(1.0, safeRadius / rm)) + Math.Acos(Math.Min(1.0, safeRadius / Math.Max(1.0, rSubject)))
+                                      - 5.0 * Math.PI / 180.0;
                     if (theta > thetaMax)
                     {
                         Vector3d axis = Vector3d.Cross(uV, tdir);
@@ -1962,6 +2338,27 @@ namespace Seamless
         }
 
         private Vector3d TravelCenter() { return travelCenter != null ? travelCenter() : travelBody.position; }
+
+        /// <summary>The opening turn: an ease-out (it reads as moving at once) whose first <paramref
+        /// name="ramp"/> (a fraction of the turn, ~0.15 s) is a cubic Hermite from rest into it, matching
+        /// its value and speed there - it no longer starts at full speed from a standing camera.</summary>
+        private static double TurnEase(double x, double ramp)
+        {
+            x = Math.Max(0.0, Math.Min(1.0, x));
+            double a = Math.Max(1e-3, Math.Min(0.5, ramp));
+            if (x >= a) return 1.0 - (1.0 - x) * (1.0 - x) * (1.0 - x);
+            double p1 = 1.0 - (1.0 - a) * (1.0 - a) * (1.0 - a);
+            double m1 = 3.0 * (1.0 - a) * (1.0 - a) * a;   // the ease-out's slope at a, per unit of t = x / a
+            double t = x / a;
+            return p1 * (3.0 * t * t - 2.0 * t * t * t) + m1 * (t * t * t - t * t);
+        }
+
+        private static double Smooth01(double x)
+        {
+            if (x <= 0) return 0;
+            if (x >= 1) return 1;
+            return x * x * (3.0 - 2.0 * x);
+        }
 
         /// <summary>Does the straight line from a to b stay outside the sphere?</summary>
         private static bool SegmentClears(Vector3d a, Vector3d b, Vector3d centre, double radius)
@@ -2102,8 +2499,9 @@ namespace Seamless
                     { SwitchInPlace(); break; }
                     if (!departAlive()) { Freeze(false); break; }
                     ApplyCurrent(true);
-                    if (t >= turnSeconds + travelSeconds)
+                    if (t >= turnSeconds + travelSeconds && (turn.Settled || t >= turnSeconds + travelSeconds + TurnSettleMax))
                     {
+                        if (kind == Kind.SaveLoad) CaptureMenuView();
                         phase = Phase.Capture;
                         overlay.BeginSceneCapture();
                         StartCoroutine(CaptureAtEndOfFrame());
@@ -2154,6 +2552,7 @@ namespace Seamless
             if (phase == Phase.Arrive) { ArriveApply(withOverlay); return; }
             if (staticDepart)
             {
+                if (doorLook) ApplyDoorLook();
                 if (withOverlay) overlay.Apply(DepartCard(Vector3d.zero, Quaternion.identity, 1.0));
                 return;
             }
@@ -2176,8 +2575,7 @@ namespace Seamless
             else
             {
             // the turn starts at once and settles (ease-out): an ease-in read as "not moving yet"
-            double tw = Math.Min(1.0, t / Math.Max(0.05, S.departTurnSeconds));
-            turnW = 1.0 - (1.0 - tw) * (1.0 - tw) * (1.0 - tw);
+            turnW = TurnEase(Math.Min(1.0, t / Math.Max(0.05, S.departTurnSeconds)), 0.15 / Math.Max(0.15, S.departTurnSeconds));
             double u = FlightU(t);
             if (directFlight) u = Math.Min(u, directSwitchU);   // the rest is flown as the arrival
             lastU = u;
@@ -2185,6 +2583,7 @@ namespace Seamless
             DepartPoseAt(u, anchor, out cam, out rot, out tanV, out weight);
             }
             cam = TerrainClamp(cam);
+            rot = Turn(rot);
             drv.Apply(cam, rot, tanV, weight);
             if (HighLogic.LoadedScene == GameScenes.SPACECENTER && drv is CameraRig)
                 KscTerrainSwitch(FlightGlobals.GetHomeBody(), cam);
@@ -2268,8 +2667,10 @@ namespace Seamless
                 Vector3 up = Vector3.Slerp(departStart.Rot * Vector3.up, end.Rot * Vector3.up, (float)u);
                 rot = ShotSolver.AimAnyRay(subject - cam, (Vector3d)ray, (Vector3d)up);
                 // what aiming leaves over at the start (a roll, or the whole turn when the
-                // destination was out of view) is taken out by DepartPoseAt over departTurnSeconds
-                if (u > 0.85) rot = Quaternion.Slerp(rot, end.Rot, Overlay.Ease((float)((u - 0.85) / 0.15)));
+                // destination was out of view) is taken out by DepartPoseAt over departTurnSeconds;
+                // what it leaves at the end, over the whole leg (squeezed into its last 15 % it was a
+                // visible twist just as the shot landed)
+                rot = SpreadEnd(rot, end.Rot, ShotSolver.AimAnyRay(subject - endCam, (Vector3d)endRay, (Vector3d)(end.Rot * Vector3.up)), u);
                 tanV = Math.Exp(Math.Log(departStart.TanV) + (Math.Log(end.TanV) - Math.Log(departStart.TanV)) * u);
                 weight = 0.3 + 0.7 * u;
 
@@ -2278,48 +2679,151 @@ namespace Seamless
                 // planet-scale flights only: a hop to a building is kept up by the soft terrain floor
                 if (!noRise) cam = OutsideSphere(cam, Pd, floor);
             }
-            else if (u < flightUMid)
+            else
             {
+                // the climb and the zoom overlap and blend: one ending at rest and the other starting
+                // in another direction made a corner the steady pacing ran straight through
                 double uMid = flightUMid;
-                double s = uMid > 0.0 ? Math.Min(1.0, u / uMid) : 1.0;
-                CamPose p = CamPose.Blend(departStart, departMid, s);
-                cam = anchor + p.Off; tanV = p.TanV; weight = 0.3 * s;
-                Vector3 upR = Vector3.Slerp(departStart.Rot * Vector3.up, departMid.Rot * Vector3.up, (float)s);
-                rot = ShotSolver.AimAnyRay(travelSubject() - cam, new Vector3d(0, 0, 1), (Vector3d)upR);
-                // never lower than where the camera started (or the clear height, if it started above it)
+                double del = 0.3 * Math.Min(uMid, 1.0 - uMid);
+                if (del < 1e-4)
+                {
+                    if (u < uMid) RiseLeg(uMid > 0.0 ? Math.Min(1.0, u / uMid) : 1.0, anchor, out cam, out rot, out tanV, out weight);
+                    else ZoomLeg(Math.Min(1.0, Math.Max(0.0, (u - uMid) / Math.Max(0.0001, 1.0 - uMid))), anchor, out cam, out rot, out tanV, out weight);
+                    return;
+                }
+                double a0 = uMid - del, a1 = uMid + del;
+                double sR = Math.Min(1.0, u / a1), sZ = Math.Min(1.0, Math.Max(0.0, (u - a0) / (1.0 - a0)));
+                if (u <= a0) { RiseLeg(sR, anchor, out cam, out rot, out tanV, out weight); return; }
+                if (u >= a1) { ZoomLeg(sZ, anchor, out cam, out rot, out tanV, out weight); return; }
+                RiseLeg(sR, anchor, out Vector3d cR, out Quaternion rR, out double tR, out double wR);
+                ZoomLeg(sZ, anchor, out Vector3d cZ, out Quaternion rZ, out double tZ, out double wZ);
+                double w = Smooth01((u - a0) / (a1 - a0));
+                cam = cR + (cZ - cR) * w;
+                rot = Quaternion.Slerp(rR, rZ, (float)w);
+                tanV = Math.Exp(Math.Log(tR) + (Math.Log(tZ) - Math.Log(tR)) * w);
+                weight = wR + (wZ - wR) * w;
                 double floor = Math.Min(safeRadius, Math.Min((anchor + departStart.Off - Pd).magnitude, (anchor + departMid.Off - Pd).magnitude));
                 cam = OutsideSphere(cam, Pd, floor);
             }
-            else
+        }
+
+        /// <summary>The climb to the clear point (departMid), s 0..1.</summary>
+        private void RiseLeg(double s, Vector3d anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight)
+        {
+            Vector3d Pd = departBody.position;
+            CamPose p = CamPose.Blend(departStart, departMid, s);
+            tanV = p.TanV; weight = 0.3 * s;
+            // around the planet's centre: the altitude on a log scale (up first), the direction
+            // turning after it. Blended along the straight line, a swing to the far side cut
+            // through the planet and the floor pushed it along the cloud tops (Kerbin -> Mun,
+            // Sun -> Kerbin), and the climb from the pad was spent in a few frames.
+            Vector3d a = anchor + departStart.Off - Pd, b = anchor + departMid.Off - Pd;
+            double la = Math.Max(1.0, a.magnitude), lb = Math.Max(1.0, b.magnitude);
+            double R = departBody.Radius;
+            double ha = Math.Max(1.0, la - R), hb = Math.Max(1.0, lb - R);
+            double sh = Smooth01(s / 0.7);
+            double h = Math.Exp(Math.Log(ha) + (Math.Log(hb) - Math.Log(ha)) * sh);
+            // the swing around the planet waits until the camera is clear of its highest terrain:
+            // started 20 % in (a few hundred metres up from the pad) it flew through the mountains
+            // (the height reaches hClear at sClear; the swing runs from there to the end of the climb)
+            double hClear = Math.Max(5000.0, HighestTerrain(departBody) + 2000.0);
+            double sClear = 0.2;
+            if (hb > hClear && ha < hClear)
             {
-                double uMid = flightUMid;
-                double s = Math.Min(1.0, Math.Max(0.0, (u - uMid) / Math.Max(0.0001, 1.0 - uMid)));
-                CamPose end = departTarget(anchor);
-                Vector3d endCam = anchor + end.Off;
-                Vector3d P = TravelCenter();
-                Vector3d um = anchor + departMid.Off - P, ue = endCam - P;
-                double dm = Math.Max(1.0, um.magnitude), de = Math.Max(1.0, ue.magnitude);
-                double dist = Math.Exp(Math.Log(dm) + (Math.Log(de) - Math.Log(dm)) * s);
-                double wd = directFlight ? DirectDirWeight(dist, dm, de) : s;
-                Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)wd).normalized;
-                cam = P + (Vector3d)dir * dist;
-
-                // destination locked on screen: from the centre of the view to its final spot
-                Vector3d subject = travelSubject();
-                Vector3 endRay = (Quaternion.Inverse(end.Rot) * (Vector3)(subject - endCam).normalized).normalized;
-                Vector3 ray = Vector3.Lerp(Vector3.forward, endRay, (float)s).normalized;
-                Vector3 up = Vector3.Slerp(departMid.Rot * Vector3.up, end.Rot * Vector3.up, (float)s);
-                rot = ShotSolver.AimAnyRay(subject - cam, (Vector3d)ray, (Vector3d)up);
-                if (s > 0.85) rot = Quaternion.Slerp(rot, end.Rot, Overlay.Ease((float)((s - 0.85) / 0.15)));
-                tanV = Math.Exp(Math.Log(departMid.TanV) + (Math.Log(end.TanV) - Math.Log(departMid.TanV)) * s);
-                weight = 0.3 + 0.7 * s;
-
-                // safety net: never below the clear height of the planet being left (or, when it is
-                // also the destination, never below the lower of the two ends of the flight)
-                double floor = Math.Min(safeRadius, (anchor + departMid.Off - Pd).magnitude);
-                if (departBody == travelBody) floor = Math.Min(floor, (endCam - Pd).magnitude);
-                cam = OutsideSphere(cam, Pd, floor);
+                double f = (Math.Log(hClear) - Math.Log(ha)) / Math.Max(1e-6, Math.Log(hb) - Math.Log(ha));
+                double x = 0.5 - Math.Sin(Math.Asin(Math.Max(-1.0, Math.Min(1.0, 1.0 - 2.0 * f))) / 3.0);   // smoothstep's inverse
+                sClear = Math.Min(0.9, 0.7 * x);
             }
+            else if (ha >= hClear) sClear = 0.0;
+            double sd = Smooth01((s - sClear) / Math.Max(1e-3, 1.0 - sClear));
+            Vector3 dirR = Vector3.Slerp((Vector3)(a / la), (Vector3)(b / lb), (float)sd).normalized;
+            cam = Pd + (Vector3d)dirR * (R + h);
+            // the first moments keep the exact start (the direction from the planet's centre is
+            // float precision: centimetres at Kerbin, a few hundred metres at the Sun)
+            if (s < 0.02) cam = Vector3d.Lerp(anchor + departStart.Off, cam, s / 0.02);
+            Vector3 upR = Vector3.Slerp(departStart.Rot * Vector3.up, departMid.Rot * Vector3.up, (float)s);
+            rot = ShotSolver.AimAnyRay(AboveHorizonOf(travelSubject() - cam, cam - Pd, departBody.Radius), new Vector3d(0, 0, 1), (Vector3d)upR);
+            // never lower than where the camera started (or the clear height, if it started above it)
+            double floor = Math.Min(safeRadius, Math.Min((anchor + departStart.Off - Pd).magnitude, (anchor + departMid.Off - Pd).magnitude));
+            cam = OutsideSphere(cam, Pd, floor);
+        }
+
+        /// <summary>The highest terrain above the planet's radius (its terrain's own maximum; 1 % of the
+        /// radius when unknown; 0 without terrain).</summary>
+        private static double HighestTerrain(CelestialBody b)
+        {
+            try
+            {
+                if (b == null || b.pqsController == null) return 0.0;
+                double m = b.pqsController.radiusMax - b.Radius;
+                return m > 0.0 && m < 0.2 * b.Radius ? m : 0.01 * b.Radius;
+            }
+            catch { return b != null ? 0.01 * b.Radius : 0.0; }
+        }
+
+        /// <summary>A direction to look in from <paramref name="rel"/> (the camera, from the planet's
+        /// centre): when it points into the planet, lifted to the horizon (+2 deg) towards it - the
+        /// climb looked at a craft on the far side through the ground, a turn of over 100 deg into the
+        /// planet right at the start.</summary>
+        private static Vector3d AboveHorizonOf(Vector3d dir, Vector3d rel, double R)
+        {
+            double r = rel.magnitude, d = dir.magnitude;
+            if (r <= R * 1.0001 || d < 1e-6) return dir;
+            Vector3d n = -rel / r, v = dir / d;                       // nadir, view
+            double alpha = Math.Asin(Math.Min(1.0, R / r)) + 2.0 * Math.PI / 180.0;   // the horizon's angle from the nadir
+            double beta = Math.Acos(Math.Max(-1.0, Math.Min(1.0, Vector3d.Dot(v, n))));
+            if (beta >= alpha) return dir;
+            // only when the planet really is in the way (not a subject in front of it)
+            double b = Vector3d.Dot(-rel, v);
+            double c = rel.sqrMagnitude - R * R;
+            double disc = b * b - c;
+            if (disc < 0.0) return dir;
+            double hit = b - Math.Sqrt(disc);
+            if (hit <= 0.0 || hit >= d) return dir;
+            Vector3d side = v - n * Vector3d.Dot(v, n);
+            if (side.sqrMagnitude < 1e-12) side = ShotSolver.Perp(n);
+            side = side.normalized;
+            return (n * Math.Cos(alpha) + side * Math.Sin(alpha)) * d;
+        }
+
+        /// <summary>The zoom from the clear point to the final shot, s 0..1.</summary>
+        private void ZoomLeg(double s, Vector3d anchor, out Vector3d cam, out Quaternion rot, out double tanV, out double weight)
+        {
+            Vector3d Pd = departBody.position;
+            CamPose end = departTarget(anchor);
+            Vector3d endCam = anchor + end.Off;
+            Vector3d P = TravelCenter();
+            Vector3d um = anchor + departMid.Off - P, ue = endCam - P;
+            double dm = Math.Max(1.0, um.magnitude), de = Math.Max(1.0, ue.magnitude);
+            double dist = Math.Exp(Math.Log(dm) + (Math.Log(de) - Math.Log(dm)) * s);
+            double wd = directFlight ? DirectDirWeight(dist, dm, de) : s;
+            Vector3 dir = Vector3.Slerp((Vector3)(um / dm), (Vector3)(ue / de), (float)wd).normalized;
+            cam = P + (Vector3d)dir * dist;
+
+            // destination locked on screen: from the centre of the view to its final spot
+            Vector3d subject = travelSubject();
+            Vector3 endRay = (Quaternion.Inverse(end.Rot) * (Vector3)(subject - endCam).normalized).normalized;
+            Vector3 ray = Vector3.Lerp(Vector3.forward, endRay, (float)s).normalized;
+            Vector3 up = Vector3.Slerp(departMid.Rot * Vector3.up, end.Rot * Vector3.up, (float)s);
+            rot = ShotSolver.AimAnyRay(subject - cam, (Vector3d)ray, (Vector3d)up);
+            rot = SpreadEnd(rot, end.Rot, ShotSolver.AimAnyRay(subject - endCam, (Vector3d)endRay, (Vector3d)(end.Rot * Vector3.up)), s);
+            tanV = Math.Exp(Math.Log(departMid.TanV) + (Math.Log(end.TanV) - Math.Log(departMid.TanV)) * s);
+            weight = 0.3 + 0.7 * s;
+
+            // safety net: never below the clear height of the planet being left (or, when it is
+            // also the destination, never below the lower of the two ends of the flight)
+            double floor = Math.Min(safeRadius, (anchor + departMid.Off - Pd).magnitude);
+            if (departBody == travelBody) floor = Math.Min(floor, (endCam - Pd).magnitude);
+            cam = OutsideSphere(cam, Pd, floor);
+        }
+
+        /// <summary>A leg aims by "subject at this spot on screen, this way up"; its end pose may differ
+        /// from that aim by a little (mostly roll). The difference is taken out over the whole leg
+        /// (smoothstep), so the leg still ends exactly on its pose.</summary>
+        private static Quaternion SpreadEnd(Quaternion aim, Quaternion endRot, Quaternion aimAtEnd, double s)
+        {
+            Quaternion res = endRot * Quaternion.Inverse(aimAtEnd);
+            return Quaternion.Slerp(Quaternion.identity, res, (float)Smooth01(s)) * aim;
         }
 
         // ------------------------------------------------------------------ flight timing
@@ -2389,8 +2893,11 @@ namespace Seamless
                 {
                     double u = (double)i / (n - 1);
                     DepartPoseAt(u, anchor, out Vector3d cam, out Quaternion rot, out double tanV, out _);
-                    double near = (cam - Pt).magnitude;
-                    if (!one) near = Math.Min(near, (cam - Po).magnitude);
+                    // height above the surfaces (a craft target: its distance): measured to the
+                    // centre, the climb from the pad to 219 km was 0.3 e-folds and took a few frames
+                    double near = (cam - Pt).magnitude - (travelCenter == null ? travelBody.Radius : 0.0);
+                    if (!one) near = Math.Min(near, (cam - Po).magnitude - departBody.Radius);
+                    else if (travelCenter != null) near = Math.Min(near, (cam - Po).magnitude - departBody.Radius);
                     near = Math.Max(1.0, near);
                     Vector3 fwd = rot * Vector3.forward;
                     double craftD = fromCraft ? Math.Max(craft0, Math.Min(20.0 * craft0, (cam - anchor).magnitude)) : craft0;
@@ -2672,6 +3179,9 @@ namespace Seamless
             };
             arriveVessel = v;
             arrivePlan = null;
+            // a new scene (or a static start): the first frame starts the limiter on its own pose;
+            // a direct flight's arrival carries on from the departure's camera
+            if (!directArrive) turn.Reset();
             arriveSize = Shots.VesselSize(v);
             CelestialBody b = v.mainBody;
             Vector3d anchor = rig.Anchor(v);
@@ -2682,6 +3192,10 @@ namespace Seamless
                 // the rest of the departure's move: from where its last frame left the camera
                 var from = new CamPose(lastCam - anchor, lastRot, lastTanV);
                 estPose = a => from;
+            }
+            else if (kind == Kind.Launch && launchCarry && LaunchCarryPose(v, anchor, out CamPose carried))
+            {
+                estPose = a => carried;
             }
             else if (kind == Kind.Launch && DoorPose(v, anchor, out Vector3d dOff, out Quaternion dRot, out Vector3 dRay, out double dTan))
             {
@@ -2855,7 +3369,11 @@ namespace Seamless
         {
             double l = Math.Log(Math.Max(1.0, dist)), lm = Math.Log(Math.Max(1.0, dm)), le = Math.Log(Math.Max(1.0, de));
             double lw = Math.Log(Math.Max(1.0, directDirDist));
-            double x = dm > 1.5 * directDirDist ? (lm - l) / Math.Max(1e-6, lm - lw) : (lm - l) / Math.Max(1e-6, lm - le);
+            // from further out than directDirDist the swing is done by then (and at least an e-fold
+            // in); only a flight starting closer turns along its whole zoom. Before, a start inside
+            // 1.5 x directDirDist turned along the whole zoom: a craft orbiting the Sun was still
+            // approached through the Sun at the switch, then swung around it looking at the Sun
+            double x = dm > directDirDist ? (lm - l) / Math.Max(1e-6, lm - Math.Min(lw, lm - 1.0)) : (lm - l) / Math.Max(1e-6, lm - le);
             x = Math.Max(0.0, Math.Min(1.0, x));
             return x * x * (3.0 - 2.0 * x);
         }
@@ -2867,11 +3385,28 @@ namespace Seamless
             directSwitchU = 1.0;
             Vector3d tp = switchVessel.GetWorldPos3D();
             const int n = 400;
+            // Not while the climb is still under way, nor with the craft's planet in the way: the
+            // arrival re-plans from the switch pose, and a switch low over the pad (a craft in orbit
+            // is within the switch distance at once) swung it "around the planet" looking at its
+            // centre instead of finishing the climb and the zoom (pad -> Kerbin orbit, 2026-11-28)
+            double uFree = 0.0;
+            if (riseRequired)
+            {
+                double uMid = flightUMid;
+                uFree = uMid + 0.3 * Math.Min(uMid, 1.0 - uMid);
+            }
+            Vector3d bp = travelBody.position;
+            double rb = travelBody.Radius * 1.005;
+            string why = "";
             for (int i = 0; i <= n; i++)
             {
                 double u = (double)i / n;
                 DepartPoseAt(u, anchor, out Vector3d cam, out _, out _, out _);
-                if ((cam - tp).magnitude <= directSwitchDist) { directSwitchU = u; break; }
+                if ((cam - tp).magnitude > directSwitchDist) continue;
+                if (u < uFree) { why = ", after the climb"; continue; }
+                if (u < 1.0 && Paths.Blocked(cam, tp, bp, rb)) { why = ", once the craft is in view"; continue; }
+                directSwitchU = u;
+                break;
             }
             // Not before the opening turn has the camera facing the craft: the arrival flies on
             // along the view it is handed, so a switch at once (a craft orbiting the Sun, whose
@@ -2881,8 +3416,8 @@ namespace Seamless
             if (T > turnEnd + 1.0)
                 directSwitchU = Math.Max(directSwitchU, FlightU(turnEnd));
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
-                "direct to the craft: switch {0:F0} km out at {1:F1} s of {2:F1} s, ending {3:F0} m away",
-                directSwitchDist / 1000.0, TimeAtU(directSwitchU), turnSeconds + travelSeconds, directEnd.Off.magnitude));
+                "direct to the craft: switch {0:F0} km out at {1:F1} s of {2:F1} s{4}, ending {3:F0} m away",
+                directSwitchDist / 1000.0, TimeAtU(directSwitchU), turnSeconds + travelSeconds, directEnd.Off.magnitude, why));
         }
 
         /// <summary>The camera's offset from the craft's planet, from the craft's own orbit (or its
@@ -3006,10 +3541,19 @@ namespace Seamless
             }
             double turn = frameHasPrev ? Quaternion.Angle(framePrevRot, lr) : 0.0;
             double moved = frameHasPrev ? (lp - framePrevCam).magnitude : 0.0;
+            // the target craft and the departure planet's surface, from the camera; the turn limiter
+            string extra = "";
+            try
+            {
+                if (tv != null) extra += string.Format(inv, ", craft {0:F2} km", (tv.GetWorldPos3D() - lp).magnitude / 1000.0);
+                if (departBody != null) extra += string.Format(inv, ", {0:F2} km above {1}", ((lp - departBody.position).magnitude - departBody.Radius) / 1000.0, departBody.bodyName);
+                extra += string.Format(inv, ", turn limiter {0} gap {1:F2} deg, turnW {2:F3}", this.turn.Engaged ? "smoothing" : "follows", this.turn.Gap, turnW);
+            }
+            catch { }
             Log.Info(string.Format(inv,
-                "frame {0}: {1}, dt {2:F3} s, t {3:F3}, u {4:F4}, camera turned {5:F3} deg, moved {6:F0} m, {7}, camera {8:F0} km from the origin{9}",
+                "frame {0}: {1}, dt {2:F3} s, t {3:F3}, u {4:F4}, camera turned {5:F3} deg, moved {6:F0} m, {7}, camera {8:F0} km from the origin{9}{10}",
                 frameN, phase, Time.unscaledDeltaTime, t, phase == Phase.Depart ? FlightU(t) : -1.0, turn, moved, planet, lp.magnitude / 1000.0,
-                phase == Phase.Depart && scaledFixOn && frameAnchor != null ? ", scaled camera placed from " + frameAnchor : ""));
+                phase == Phase.Depart && scaledFixOn && frameAnchor != null ? ", scaled camera placed from " + frameAnchor : "", extra));
             frameN++;
             framePrevRot = lr;
             framePrevCam = lp;
@@ -3133,7 +3677,7 @@ namespace Seamless
                     StartReturn(S.zoomInSeconds);
                 }
             }
-            if (retStart >= 0 && t >= retStart + retDur)
+            if (retStart >= 0 && t >= retStart + retDur && (turn.Settled || t >= retStart + retDur + TurnSettleMax))
             {
                 rig.HandBack();
                 Cleanup();
@@ -3154,6 +3698,38 @@ namespace Seamless
                     "the craft is behind {0}: zooming around it (in view at {1:F0} % of the zoom)", b.bodyName, arrivePlan.Sw * 100.0));
             retStart = t;
             retDur = duration;
+            arrivePace = null;
+            // the normal zoom (not one cut short by a key): paced like the departures
+            if (Math.Abs(duration - S.zoomInSeconds) < 1e-6)
+            {
+                CamPose home = rig.Home();
+                CamPose from0 = retFrom;
+                Paths.Plan plan = arrivePlan;
+                Vector3d bp = b.position;
+                double R = b.Radius;
+                arrivePace = Pace.Build((double x, out Vector3d c, out Quaternion r, out double tn) =>
+                {
+                    CamPose q = plan != null ? Paths.Around(from0, home, anchor, bp, R, x, plan, ZoomTo) : ZoomTo(from0, home, x);
+                    c = anchor + q.Off; r = q.Rot; tn = q.TanV;
+                }, c => Math.Min((c - anchor).magnitude, (c - bp).magnitude - R),
+                    S.flightMaxRate, S.flightMaxAccel, 0.6 * S.zoomInSeconds, 2.0 * S.zoomInSeconds);
+                if (arrivePace != null)
+                {
+                    retDur = arrivePace.T;
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "zoom in paced: {0:F1} e-folds of view change, {1:F1} s", arrivePace.EFolds, retDur));
+                }
+            }
+        }
+
+        private Pace arrivePace, kscPace;
+
+        /// <summary>Path position of the zoom after a load at the current time.</summary>
+        private double ReturnS(Pace pace)
+        {
+            if (retStart < 0) return 0.0;
+            if (pace != null) return pace.U(t - retStart);
+            return Overlay.Ease((float)((t - retStart) / retDur));
         }
 
         /// <summary>
@@ -3205,7 +3781,7 @@ namespace Seamless
                 skyWeight = 1.0;
                 return estPose(anchor);
             }
-            double s = Overlay.Ease((float)((t - retStart) / retDur));
+            double s = ReturnS(arrivePace);
             skyWeight = 1.0 - s;
             if (arrivePlan != null)
             {
@@ -3229,7 +3805,12 @@ namespace Seamless
             Vector3 ray = Vector3.Slerp(rayFrom, rayTo, (float)s).normalized;
             Vector3 up = Vector3.Slerp(from.Rot * Vector3.up, to.Rot * Vector3.up, (float)s);
             Quaternion rot = ShotSolver.AimAnyRay(-p.Off, (Vector3d)ray, (Vector3d)up);
-            if (s > 0.85) rot = Quaternion.Slerp(rot, to.Rot, Overlay.Ease((float)((s - 0.85) / 0.15)));
+            // the aim's leftover against each end pose (mostly roll), spread over the whole zoom:
+            // exact at both ends, no twist in the last 15 % as the shot lands
+            Quaternion aimFrom = ShotSolver.AimAnyRay(-from.Off, (Vector3d)rayFrom, (Vector3d)(from.Rot * Vector3.up));
+            Quaternion aimTo = ShotSolver.AimAnyRay(-to.Off, (Vector3d)rayTo, (Vector3d)(to.Rot * Vector3.up));
+            Quaternion resFrom = from.Rot * Quaternion.Inverse(aimFrom), resTo = to.Rot * Quaternion.Inverse(aimTo);
+            rot = Quaternion.Slerp(resFrom, resTo, (float)Smooth01(s)) * rot;
             return new CamPose(p.Off, rot, p.TanV);
         }
 
@@ -3248,9 +3829,10 @@ namespace Seamless
             {
                 // the flight from the building's entrance stays above the ground; the floor lets go
                 // as the zoom lands, so the hand-back pose is exact
-                double s = retStart >= 0 ? Overlay.Ease((float)((t - retStart) / retDur)) : 0.0;
+                double s = ReturnS(arrivePace);
                 if (s < 1.0) { Vector3d lifted = SoftGround(v.mainBody, cam, 3.0, 6.0); cam = lifted + (cam - lifted) * s; }
             }
+            p.Rot = Turn(p.Rot);
             rig.Apply(cam, p.Rot, p.TanV, skyWeight);
             if (!withOverlay) return;
 
@@ -3305,6 +3887,125 @@ namespace Seamless
         /// </summary>
         private bool kscAerial;
         private Vector3 kscRay;
+        private bool kscMenu;   // the opening shot recreates the main menu's view of the home planet
+
+        // The main menu's view of its planet, in that planet's light frame: forward = towards its
+        // light (in the equator plane), up = its axis; the camera's offset in planet radii.
+        private bool menuViewValid;
+        private Vector3 menuCamRel;
+        private Quaternion menuRotRel;
+        private double menuTan;
+
+        /// <summary>The main menu shows its own planet (stock: a menu Kerbin; Kopernicus: a copy of
+        /// the home planet's distant model), turning in place, under its own fixed light. Read at the
+        /// freeze: where its camera sits against that planet, in radii, in the frame of the planet's
+        /// axis and its light - so the Space Center scene can open on the same view of the real
+        /// planet, lit from the same side (the real planet's turn and the Sun are set by the save's
+        /// time: the continents differ, the size, place on screen, tilt and lit part do not).</summary>
+        private void CaptureMenuView()
+        {
+            menuViewValid = false;
+            try
+            {
+                MainMenu main = UnityEngine.Object.FindObjectOfType<MainMenu>();
+                MainMenuEnvLogic env = main != null ? main.envLogic : null;
+                Camera mc = env != null ? env.landscapeCamera : null;
+                if (mc == null || env.areas == null) { Log.Info("menu view: no menu camera"); return; }
+                CelestialBody home = FlightGlobals.GetHomeBody();
+                string hn = home != null ? home.transform.name : "Kerbin";
+                Renderer best = null;
+                double rMenu = 0.0;
+                foreach (GameObject area in env.areas)
+                {
+                    if (area == null || !area.activeInHierarchy) continue;
+                    foreach (Renderer r in area.GetComponentsInChildren<Renderer>(false))
+                    {
+                        if (r == null || !r.enabled) continue;
+                        string n = r.gameObject.name;
+                        if (n != hn && n != "Kerbin") continue;
+                        Vector3 ex = r.bounds.extents;
+                        double e = Math.Max(ex.x, Math.Max(ex.y, ex.z));
+                        if (e > rMenu) { rMenu = e; best = r; }
+                    }
+                }
+                if (best == null || rMenu <= 0.0) { Log.Info("menu view: no planet named " + hn + " in the menu scene"); return; }
+                Vector3 C = best.bounds.center;
+                // the radius from the mesh in its own frame: the world box of a turning planet changes
+                // with its turn (2000 and 2121 in two loads; the camera came out too close)
+                double rBox = rMenu;
+                MeshFilter mf = best.GetComponent<MeshFilter>();
+                Mesh mesh = mf != null ? mf.sharedMesh : null;
+                if (mesh != null)
+                {
+                    Vector3 ls = best.transform.lossyScale;
+                    Vector3 me = mesh.bounds.extents;
+                    double rLocal = Math.Min(Math.Abs(me.x * ls.x), Math.Min(Math.Abs(me.y * ls.y), Math.Abs(me.z * ls.z)));
+                    C = best.transform.TransformPoint(mesh.bounds.center);
+                    if (mesh.isReadable)
+                    {
+                        Vector3[] vs = mesh.vertices;
+                        double sum = 0.0;
+                        Vector3 mc0 = mesh.bounds.center;
+                        for (int i = 0; i < vs.Length; i++) sum += (vs[i] - mc0).magnitude;
+                        if (vs.Length > 0) rLocal = sum / vs.Length * Math.Abs(ls.x);
+                    }
+                    if (rLocal > 0.0) rMenu = rLocal;
+                    Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "menu view: planet radius {0:G5} from its mesh ({1}), world box {2:G5}, scale ({3:G4}, {4:G4}, {5:G4})",
+                        rMenu, mesh.isReadable ? "mean vertex distance" : "local bounds", rBox, ls.x, ls.y, ls.z));
+                }
+                // the key light: the one lighting the side the camera sees (the menu also has a back
+                // light for the rim - taken first, it put the save's planet on its night side)
+                Vector3 toCamera = (mc.transform.position - C).normalized;
+                Light sun = null;
+                double sunScore = 0.0;
+                var lights = new System.Text.StringBuilder();
+                foreach (Light l in UnityEngine.Object.FindObjectsOfType<Light>())
+                {
+                    if (l == null || !l.enabled || l.type != LightType.Directional || !l.gameObject.activeInHierarchy) continue;
+                    if (l.gameObject.scene != mc.gameObject.scene) continue;
+                    if ((l.cullingMask & (1 << best.gameObject.layer)) == 0) continue;
+                    double lit = Vector3.Dot(-l.transform.forward, toCamera);
+                    double score = l.intensity * Math.Max(0.0, lit);
+                    lights.Append(string.Format(System.Globalization.CultureInfo.InvariantCulture, " '{0}' {1:F2} facing {2:F2};", l.gameObject.name, l.intensity, lit));
+                    if (score > sunScore) { sunScore = score; sun = l; }
+                }
+                Diag("menu view: directional lights on the planet:" + lights);
+                if (sun == null) { Log.Info("menu view: no light on the planet's camera side"); return; }
+                // the axis: the object the menu turns (Rotato turns about its own Y)
+                Rotato spin = best.GetComponentInParent<Rotato>();
+                Vector3 north = spin != null ? spin.transform.up : best.transform.up;
+                Quaternion F = LightFrame(-sun.transform.forward, north);
+                Vector3 rel = Quaternion.Inverse(F) * ((mc.transform.position - C) / (float)rMenu);
+                double dist = rel.magnitude;
+                Vector3 toPlanet = (C - mc.transform.position).normalized;
+                double tan = Math.Tan(mc.fieldOfView * 0.5 * Math.PI / 180.0);
+                double size = dist > 1.0 ? Math.Tan(Math.Asin(1.0 / dist)) / tan : 1.0;   // planet radius / half the view height
+                float facing = Vector3.Dot(mc.transform.forward, toPlanet);
+                Vector3 vp = mc.WorldToViewportPoint(C);
+                Diag(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "menu view: planet centre at viewport ({0:F3}, {1:F3}), camera aspect {2:F3} (screen {3:F3}), axis from {4}",
+                    vp.x, vp.y, mc.aspect, (double)Screen.width / Math.Max(1, Screen.height), spin != null ? "'" + spin.gameObject.name + "' (turning)" : "the renderer"));
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "menu view: planet '{0}' r {1:G4} (layer {2}), light '{3}' {4:F2}, camera {5:F2} radii out, fov {6:F1} deg, planet {7:F2} of the half-height, facing {8:F2}",
+                    best.gameObject.name, rMenu, best.gameObject.layer, sun.gameObject.name, sun.intensity, dist, mc.fieldOfView, size, facing));
+                if (dist <= 1.05 || facing < 0.3f || size < 0.05) { Log.Info("menu view: the planet is not the menu's subject - the usual shot"); return; }
+                menuCamRel = rel;
+                menuRotRel = Quaternion.Inverse(F) * mc.transform.rotation;
+                menuTan = tan;
+                menuViewValid = true;
+            }
+            catch (Exception e) { Log.Warn("menu view: " + e.Message); }
+        }
+
+        /// <summary>forward = the light's direction in the equator plane, up = the planet's axis.</summary>
+        private static Quaternion LightFrame(Vector3 toLight, Vector3 north)
+        {
+            north = north.normalized;
+            Vector3 f = toLight - north * Vector3.Dot(toLight, north);
+            if (f.sqrMagnitude < 1e-8f) f = (Vector3)ShotSolver.Perp((Vector3d)north);
+            return Quaternion.LookRotation(f.normalized, north);
+        }
 
         private void BeginArriveKsc()
         {
@@ -3320,7 +4021,28 @@ namespace Seamless
             kscSx = lowerThird ? 1.0 - 2.0 * S.planetScreenX : 2.0 * S.planetScreenX - 1.0;
             Quaternion q = BodyRotation(home);
             kscAerial = false;
-            if (carryValid && carryBody == home && carryAerial)
+            kscMenu = false;
+            Vector3d menuSun = kind == Kind.SaveLoad && menuViewValid ? Shots.SunDir(home) : Vector3d.zero;
+            if (menuSun.sqrMagnitude > 0.5)
+            {
+                // the main menu's view, on the real planet: same distance in radii, same place
+                // against its axis and the Sun
+                Quaternion F = LightFrame((Vector3)menuSun, q * Vector3.up);
+                Vector3d camW = home.position + (Vector3d)(F * menuCamRel) * home.Radius;
+                Quaternion rotW = F * menuRotRel;
+                Quaternion inv = Quaternion.Inverse(q);
+                kscOffB = (Vector3d)(inv * (Vector3)(camW - KscSite(home)));
+                kscRotB = inv * rotW;
+                kscTan = menuTan;
+                kscMenu = true;
+                Vector3 q0 = Quaternion.Inverse(rotW) * (Vector3)(home.position - camW).normalized;
+                double vx = q0.z > 0.01f ? 0.5 + 0.5 * q0.x / (q0.z * menuTan * CameraRig.Aspect) : double.NaN;
+                double vy = q0.z > 0.01f ? 0.5 + 0.5 * q0.y / (q0.z * menuTan) : double.NaN;
+                Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                    "arriving at the Space Center from the main menu's view: {0:F0} km up, fov {1:F1} deg, planet centre at viewport ({2:F3}, {3:F3})",
+                    ((camW - home.position).magnitude - home.Radius) / 1000.0, 2.0 * Math.Atan(menuTan) * 180.0 / Math.PI, vx, vy));
+            }
+            else if (carryValid && carryBody == home && carryAerial)
             {
                 // a short flight from near the Space Center: its aerial view
                 kscAerial = true;
@@ -3373,6 +4095,7 @@ namespace Seamless
             kscRig.Take();
             t = 0;
             retStart = -1;
+            turn.Reset();
             phase = Phase.ArriveKsc;
             KscPoses(home, out CamPose from, out CamPose to, out Vector3d kAnchor);
             Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
@@ -3397,6 +4120,12 @@ namespace Seamless
             anchor = kscScc != null ? (Vector3d)kscScc.transform.position : (Vector3d)kscCt.position;
             to = new CamPose((Vector3d)kscCt.position - anchor, kscCt.rotation, kscHomeTan);
             Quaternion q = BodyRotation(home);
+            if (kscMenu)
+            {
+                // fixed against the planet (no re-aim): the menu's framing
+                from = new CamPose(KscSite(home) + (Vector3d)(q * (Vector3)kscOffB) - anchor, q * kscRotB, kscTan);
+                return;
+            }
             if (kscAerial)
             {
                 CamPose pa = Shots.ReaimOnVessel((Vector3d)(q * (Vector3)kscOffB), q * kscRotB, kscRay, kscTan);
@@ -3511,7 +4240,7 @@ namespace Seamless
                 retDur = S.zoomInSeconds;
                 PlanKsc();
             }
-            if (retStart >= 0 && t >= retStart + retDur)
+            if (retStart >= 0 && t >= retStart + retDur && (turn.Settled || t >= retStart + retDur + TurnSettleMax))
             {
                 ReleaseKsc();
                 Cleanup();
@@ -3523,6 +4252,7 @@ namespace Seamless
         private void PlanKsc()
         {
             kscPlan = null;
+            kscPace = null;
             if (kscFromBuilding) return;   // a short hop over the Space Center
             CelestialBody home = FlightGlobals.GetHomeBody();
             if (home == null || kscCt == null) return;
@@ -3531,6 +4261,25 @@ namespace Seamless
             if (kscPlan != null)
                 Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
                     "the Space Center is behind {0}: zooming around it (in view at {1:F0} % of the zoom)", home.bodyName, kscPlan.Sw * 100.0));
+            // the normal zoom down: paced like the departures
+            if (Math.Abs(retDur - S.zoomInSeconds) < 1e-6)
+            {
+                Paths.Plan plan = kscPlan;
+                Vector3d hp = home.position;
+                double R = home.Radius;
+                kscPace = Pace.Build((double x, out Vector3d c, out Quaternion r, out double tn) =>
+                {
+                    CamPose q = plan != null ? Paths.Around(from, to, anchor, hp, R, x, plan, ZoomTo) : ZoomTo(from, to, x);
+                    c = anchor + q.Off; r = q.Rot; tn = q.TanV;
+                }, c => Math.Min((c - anchor).magnitude, (c - hp).magnitude - R),
+                    S.flightMaxRate, S.flightMaxAccel, 0.6 * S.zoomInSeconds, 2.0 * S.zoomInSeconds);
+                if (kscPace != null)
+                {
+                    retDur = kscPace.T;
+                    Log.Info(string.Format(System.Globalization.CultureInfo.InvariantCulture,
+                        "zoom down paced: {0:F1} e-folds of view change, {1:F1} s", kscPace.EFolds, retDur));
+                }
+            }
         }
 
         private void KscApply(bool withOverlay)
@@ -3538,19 +4287,26 @@ namespace Seamless
             if (kscRig == null || kscCt == null) return;
             CelestialBody home = FlightGlobals.GetHomeBody();
             if (home == null) return;
-            double s = retStart >= 0 ? Overlay.Ease((float)((t - retStart) / retDur)) : 0.0;
+            double s = ReturnS(kscPace);
             KscPoses(home, out CamPose from, out CamPose to, out Vector3d anchor);
             CamPose p = kscPlan != null ? Paths.Around(from, to, anchor, home.position, home.Radius, s, kscPlan, ZoomTo)
                                         : ZoomTo(from, to, s);
             Vector3d cam = anchor + p.Off;
             bool warming = kscWarmDoneAt < 0;
             if (warming)
-                kscRig.Apply(anchor + to.Off, to.Rot, to.TanV, 0.0);   // hidden by the card
-            else if (s < 1.0)
             {
-                // never through the planet or the terrain; lets go at the end (exact hand-over)
-                Vector3d lifted = SoftGround(home, OutsideSphere(cam, home.position, home.Radius + 50.0), 4.0, 8.0);
-                cam = lifted + (cam - lifted) * (s * s);
+                kscRig.Apply(anchor + to.Off, to.Rot, to.TanV, 0.0);   // hidden by the card
+                turn.Reset();   // the first shown frame starts the limiter on its own pose
+            }
+            else
+            {
+                p.Rot = Turn(p.Rot);
+                if (s < 1.0)
+                {
+                    // never through the planet or the terrain; lets go at the end (exact hand-over)
+                    Vector3d lifted = SoftGround(home, OutsideSphere(cam, home.position, home.Radius + 50.0), 4.0, 8.0);
+                    cam = lifted + (cam - lifted) * (s * s);
+                }
             }
             if (!warming) kscRig.Apply(cam, p.Rot, p.TanV, 1.0 - s);
             KscTerrainSwitch(home, warming ? anchor + to.Off : cam);
@@ -3941,6 +4697,13 @@ namespace Seamless
                 else Log.Info("KSP's own loading screen had already ended");
             }
             phase = Phase.Idle;
+            doorLook = false;
+            if (doorCamDrivers != null)
+            {
+                if (HighLogic.LoadedScene == GameScenes.EDITOR)
+                    foreach (Behaviour b in doorCamDrivers) if (b != null) b.enabled = true;
+                doorCamDrivers = null;
+            }
             KscTerrainOn();
             try { if (overlay != null) overlay.Destroy(); } catch { }
             overlay = null;

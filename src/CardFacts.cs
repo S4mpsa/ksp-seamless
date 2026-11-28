@@ -5,7 +5,7 @@ using System.Globalization;
 namespace Seamless
 {
     /// <summary>Extra lines for the cards: the save being loaded (funds, science, reputation,
-    /// flights, the time of day at the Space Center), a craft's next event, a planet's facts.</summary>
+    /// flights), a craft's next event, a planet's facts.</summary>
     internal static class CardFacts
     {
         private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
@@ -14,7 +14,7 @@ namespace Seamless
 
         /// <summary>Lines for a save being loaded, read from the save itself (its scenarios are not
         /// running yet at the main menu).</summary>
-        public static List<string> Save(Game g, double ut, double kscLat, double kscLon)
+        public static List<string> Save(Game g)
         {
             var lines = new List<string>();
             try
@@ -44,8 +44,6 @@ namespace Seamless
                 if (flights > 0) lines.Add(flights.ToString("N0", Inv) + (flights == 1 ? " flight in progress" : " flights in progress"));
             }
             catch { }
-            string lt = KscLocalTime(ut, kscLat, kscLon);
-            if (lt != null) lines.Add(lt);
             return lines;
         }
 
@@ -73,39 +71,11 @@ namespace Seamless
             }
         }
 
-        /// <summary>The time of day at the Space Center at <paramref name="ut"/>, from the home
-        /// planet's rotation and orbit (no scene needed): the body frame turns by
-        /// initialRotation + 360 UT / rotationPeriod about the axis, the Sun's direction comes
-        /// from the orbit at that time. Shown on KSP's clock (a 6 h or 24 h day).</summary>
-        public static string KscLocalTime(double ut, double lat, double lon)
-        {
-            try
-            {
-                CelestialBody home = FlightGlobals.GetHomeBody();
-                if (home == null || home.orbit == null || home.rotationPeriod <= 0) return null;
-                if (double.IsNaN(lat)) { lat = -0.0972; lon = -74.5577; }
-                double rot = (home.initialRotation + 360.0 * ut / home.rotationPeriod) % 360.0;
-                double site = (lon + rot) * Math.PI / 180.0;
-                Vector3d toSun = -home.orbit.getRelativePositionAtUT(ut);   // zup, as the body frame
-                double sun = Math.Atan2(toSun.y, toSun.x);
-                double hourAngle = site - sun;
-                double f = 0.5 + hourAngle / (2.0 * Math.PI);           // 0 = midnight, 0.5 = noon
-                f -= Math.Floor(f);
-                double daySec = 21600.0;
-                try { daySec = KSPUtil.dateTimeFormatter.Day; } catch { }
-                double clock = f * daySec;
-                int h = (int)Math.Floor(clock / 3600.0);
-                int m = (int)Math.Floor((clock - h * 3600.0) / 60.0);
-                string part = f < 0.22 || f >= 0.8 ? "night" : f < 0.45 ? "morning" : f < 0.55 ? "midday" : f < 0.72 ? "afternoon" : "evening";
-                return string.Format(Inv, "{0}:{1:00} local time at the Space Center ({2})", h, m, part);
-            }
-            catch { return null; }
-        }
-
         // ------------------------------------------------------------------ craft
 
         /// <summary>The craft's next event, if any: the next maneuver node, an SOI change along its
-        /// patches (arrival at a body, or leaving one), or an alarm set for it - the soonest.</summary>
+        /// patches (arrival at a body, or leaving one; only while in space), or an alarm set for it
+        /// (named as an alarm: its title is the player's own) - the soonest.</summary>
         public static string NextEvent(Vessel v)
         {
             if (v == null) return null;
@@ -134,38 +104,48 @@ namespace Seamless
                 }
             }
             catch { }
-            // SOI changes along the patches
-            try
-            {
-                Orbit o = v.orbit;
-                bool found = false;
-                for (int i = 0; i < 6 && o != null && !found; i++)
+            // SOI changes: only for a craft out in space (not landed, splashed, on the pad or in the
+            // atmosphere), and the patch chain only where KSP keeps it current - a loaded craft with
+            // its own solver whose first patch covers now (an unloaded craft's patches are stale)
+            bool inSpace = v.situation == Vessel.Situations.ORBITING || v.situation == Vessel.Situations.SUB_ORBITAL
+                           || v.situation == Vessel.Situations.ESCAPING;
+            if (inSpace)
+                try
                 {
-                    if (o.patchEndTransition == Orbit.PatchTransitionType.ENCOUNTER && o.nextPatch != null)
+                    Orbit o = v.orbit;
+                    bool live = v.loaded && v.patchedConicSolver != null && o != null
+                                && o.StartUT <= now + 1.0 && o.EndUT > now;
+                    bool found = false;
+                    if (live)
+                        for (int i = 0; i < 6 && o != null && !found; i++)
+                        {
+                            if (double.IsNaN(o.EndUT) || double.IsInfinity(o.EndUT) || o.nextPatch == null
+                                || o.nextPatch.referenceBody == null || o.referenceBody == null) break;
+                            if (o.patchEndTransition == Orbit.PatchTransitionType.ENCOUNTER)
+                            {
+                                Offer(o.EndUT, ArrivalText.BodyName(o.nextPatch.referenceBody) + " arrival");
+                                found = true;
+                            }
+                            else if (o.patchEndTransition == Orbit.PatchTransitionType.ESCAPE)
+                            {
+                                // past an escape, an encounter further on is the bigger event
+                                if (i == 0) Offer(o.EndUT, "leaving " + ArrivalText.BodyName(o.referenceBody));
+                            }
+                            else break;
+                            o = o.nextPatch;
+                        }
+                    // without live patches an escape is still worked out from the orbit itself
+                    o = v.orbit;
+                    if (!live && o != null && o.referenceBody != null
+                        && (o.eccentricity >= 1.0 || o.ApR > o.referenceBody.sphereOfInfluence)
+                        && o.referenceBody.sphereOfInfluence < 1e15)
                     {
-                        Offer(o.EndUT, ArrivalText.BodyName(o.nextPatch.referenceBody) + " arrival");
-                        found = true;
+                        double ta = o.TrueAnomalyAtRadius(o.referenceBody.sphereOfInfluence);
+                        double ut = o.GetUTforTrueAnomaly(ta, o.period > 0 && !double.IsInfinity(o.period) ? o.period : 0.0);
+                        if (!double.IsNaN(ut) && !double.IsInfinity(ut)) Offer(ut, "leaving " + ArrivalText.BodyName(o.referenceBody));
                     }
-                    else if (o.patchEndTransition == Orbit.PatchTransitionType.ESCAPE && o.nextPatch != null)
-                    {
-                        // past an escape, an encounter further on is the bigger event
-                        if (i == 0) Offer(o.EndUT, "leaving " + ArrivalText.BodyName(o.referenceBody));
-                    }
-                    else break;
-                    o = o.nextPatch;
                 }
-                // unloaded craft carry no patches: an escape is still worked out from the orbit
-                o = v.orbit;
-                if (!found && o != null && o.referenceBody != null && o.nextPatch == null
-                    && (o.eccentricity >= 1.0 || o.ApR > o.referenceBody.sphereOfInfluence)
-                    && o.referenceBody.sphereOfInfluence < 1e15)
-                {
-                    double ta = o.TrueAnomalyAtRadius(o.referenceBody.sphereOfInfluence);
-                    double ut = o.GetUTforTrueAnomaly(ta, o.period > 0 && !double.IsInfinity(o.period) ? o.period : 0.0);
-                    if (!double.IsNaN(ut)) Offer(ut, "leaving " + ArrivalText.BodyName(o.referenceBody));
-                }
-            }
-            catch { }
+                catch { }
             // alarms set for this craft
             try
             {
@@ -173,7 +153,7 @@ namespace Seamless
                 if (ac != null && ac.alarms != null)
                     foreach (AlarmTypeBase a in ac.alarms.Values)
                         if (a != null && a.vesselId != 0 && a.vesselId == v.persistentId)
-                            Offer(a.ut, string.IsNullOrEmpty(a.title) ? "an alarm" : a.title);
+                            Offer(a.ut, string.IsNullOrEmpty(a.title) ? "an alarm" : "the \"" + a.title + "\" alarm");
             }
             catch { }
             if (what == null) return null;

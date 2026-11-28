@@ -51,6 +51,9 @@ namespace Seamless
         public bool editorExitTransition = true;   // VAB / SPH -> Space Center
         public bool trackingFromSpaceCenter = true;// Space Center -> Tracking Station
         public bool launchTransition = true;       // VAB / SPH -> launch site
+        public float launchDoorSeconds = 1f;     // hidden: launch from the VAB / SPH: the camera turns to look out of the doors over this long (0 = off)
+        public float vabDoorHeading = float.NaN; // hidden: the VAB doors' direction (deg, editor scene, 0 = +Z, 90 = +X) when the scan gets it wrong
+        public float sphDoorHeading = float.NaN; // hidden: the same for the SPH
         public float launchHoldSeconds = 0.5f;     // bars + card over the editor before the load
         public bool spaceCenterFromTrackingStation = true; // Tracking Station -> Space Center
         public bool saveLoadTransition = true;     // main menu -> a save's Space Center
@@ -71,6 +74,8 @@ namespace Seamless
         public float departSeconds = 1.5f;      // shortest flight to the destination
         public float departMaxSeconds = 6f;  // longest flight (interplanetary)
         public float flightMaxRate = 5f;      // flights: fastest view change, e-folds of distance (plus radians of turn) per second
+        public float maxTurnRate = 90f;      // hidden: the transition camera never turns faster than this (deg/s; 0 = off)
+        public float maxTurnAccel = 180f;    // hidden: ... nor speeds its turn up or down faster than this (deg/s^2)
         public float flightMaxAccel = 6f;   // ... and its largest change per second (gentle starts and ends)
         public float loadingMinSeconds = 0f;  // the loading card shows at least this long
         public float establishSeconds = 0f;   // vessel switch: hold on the opening shot
@@ -145,6 +150,9 @@ namespace Seamless
                 Bool(n, "trackingFromSpaceCenter", ref s.trackingFromSpaceCenter);
                 Bool(n, "launchTransition", ref s.launchTransition);
                 Float(n, "launchHoldSeconds", ref s.launchHoldSeconds);
+                Float(n, "launchDoorSeconds", ref s.launchDoorSeconds);
+                Float(n, "vabDoorHeading", ref s.vabDoorHeading);
+                Float(n, "sphDoorHeading", ref s.sphDoorHeading);
                 Bool(n, "spaceCenterFromTrackingStation", ref s.spaceCenterFromTrackingStation);
                 Bool(n, "saveLoadTransition", ref s.saveLoadTransition);
                 Bool(n, "mainMenuTransition", ref s.mainMenuTransition);
@@ -165,6 +173,8 @@ namespace Seamless
                 Float(n, "departMaxSeconds", ref s.departMaxSeconds);
                 Float(n, "flightMaxRate", ref s.flightMaxRate);
                 Float(n, "flightMaxAccel", ref s.flightMaxAccel);
+                Float(n, "maxTurnRate", ref s.maxTurnRate);
+                Float(n, "maxTurnAccel", ref s.maxTurnAccel);
                 Float(n, "loadingMinSeconds", ref s.loadingMinSeconds);
                 Float(n, "establishSeconds", ref s.establishSeconds);
                 Float(n, "zoomInSeconds", ref s.zoomInSeconds);
@@ -207,6 +217,7 @@ namespace Seamless
             returnSeconds = Mathf.Max(0.5f, returnSeconds);
             departTurnSeconds = Mathf.Max(0.3f, departTurnSeconds);
             launchHoldSeconds = Mathf.Max(0.3f, launchHoldSeconds);
+            launchDoorSeconds = Mathf.Clamp(launchDoorSeconds, 0f, 5f);
             saveHoldSeconds = Mathf.Max(0f, saveHoldSeconds);
             settleQuietSeconds = Mathf.Clamp(settleQuietSeconds, 0f, 10f);
             settleMaxSeconds = Mathf.Clamp(settleMaxSeconds, 0f, 300f);
@@ -215,6 +226,8 @@ namespace Seamless
             departMaxSeconds = Mathf.Max(departSeconds, departMaxSeconds);
             flightMaxRate = Mathf.Clamp(flightMaxRate, 0.2f, 20f);
             flightMaxAccel = Mathf.Clamp(flightMaxAccel, 0.1f, 20f);
+            maxTurnRate = maxTurnRate <= 0f ? 0f : Mathf.Clamp(maxTurnRate, 10f, 720f);
+            maxTurnAccel = Mathf.Clamp(maxTurnAccel, 10f, 2000f);
             loadingMinSeconds = Mathf.Max(0f, loadingMinSeconds);
             cardTargetSeconds = Mathf.Clamp(cardTargetSeconds, 0f, 60f);
             cardSkipSeconds = Mathf.Clamp(cardSkipSeconds, 0f, 10f);
